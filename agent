@@ -1,0 +1,339 @@
+"""
+edr_agent.py — Agent EDR à installer sur une machine à surveiller.
+
+⚠️ NE JAMAIS installer ce programme sur une machine sans l'accord
+explicite de son propriétaire ou de l'administrateur du parc.
+
+Contrairement à la version précédente, ce fichier NE CONTIENT PLUS
+la clé API ni l'adresse du serveur en dur dans le code. Au premier
+lancement, une petite fenêtre demande ces informations et les
+enregistre dans un fichier de configuration LOCAL à la machine :
+
+    %APPDATA%\\EDRAgent\\config.json   (Windows)
+    ~/.config/EDRAgent/config.json      (Linux/macOS)
+
+Pourquoi ce changement : si vous compilez ce script en .exe pour le
+distribuer à vos clients (voir instructions PyInstaller plus bas),
+un utilisateur qui décompile l'exe ne doit voir NI votre code source
+NI la clé d'un autre client. Chaque poste stocke uniquement SA
+propre clé, saisie une fois lors de l'installation.
+
+Ce que fait l'agent :
+  - Envoie un "heartbeat" toutes les X secondes (CPU, RAM, disque, OS,
+    modèle CPU, RAM totale, IP locale, utilisateur connecté, top processus)
+  - Surveille les processus en cours et, sur une liste basique de noms
+    connus comme malveillants, TERMINE le processus et enregistre le
+    fichier exécutable concerné dans la liste de quarantaine du dashboard
+    (liste à adapter — ce n'est PAS un antivirus complet)
+
+Ce que l'agent NE fait PAS :
+  - Il ne déplace, ne supprime, ni ne chiffre aucun fichier — seul le
+    PROCESSUS en cours d'exécution est arrêté ; le fichier reste en place
+    sur le disque (pour éviter tout dégât en cas de faux positif)
+  - Il ne lit ni ne transmet le contenu d'aucun fichier personnel
+  - Il ne prend pas le contrôle du clavier/souris/écran
+  - Il n'ouvre aucun accès distant vers la machine
+
+Installation (pour lancer le .py directement) :
+    pip install requests psutil
+
+Pour le distribuer en .exe (voir aussi build_agent.bat fourni à côté) :
+    pip install pyinstaller
+    pyinstaller --onefile --name EDRAgent edr_agent.py
+"""
+
+import json
+import os
+import platform
+import socket
+import sys
+import time
+
+import psutil
+import requests
+
+APP_NAME = "EDRAgent"
+REPORT_INTERVAL_SECONDS = 15
+
+
+def _redirect_output_if_no_console():
+    """Sous pythonw.exe (lancé sans fenêtre, ex: démarrage automatique via
+    Tâches planifiées) ou un .exe compilé en --windowed, sys.stdout/stderr
+    valent None : le moindre print() ferait planter le script. On redirige
+    alors la sortie vers un fichier log, pour garder une trace utile."""
+    if sys.stdout is None or sys.stderr is None:
+        if platform.system() == "Windows":
+            base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".config")
+        folder = os.path.join(base, APP_NAME)
+        os.makedirs(folder, exist_ok=True)
+        log_file = open(os.path.join(folder, "agent.log"), "a", encoding="utf-8", buffering=1)
+        sys.stdout = log_file
+        sys.stderr = log_file
+
+
+_redirect_output_if_no_console()
+
+# Liste très basique de noms de processus considérés comme sensibles, à
+# titre d'exemple pédagogique. À adapter (idéalement pilotée depuis le
+# serveur plutôt qu'en dur ici).
+SUSPICIOUS_PROCESS_NAMES = {
+    "mimikatz.exe": ("critical", "credential_access", "Outil de vol d'identifiants détecté"),
+    "psexec.exe":   ("medium",   "lateral_movement",  "Outil d'exécution distante détecté"),
+    "netcat.exe":   ("medium",   "network",            "Outil réseau potentiellement utilisé pour l'exfiltration"),
+    "nc.exe":       ("medium",   "network",            "Outil réseau potentiellement utilisé pour l'exfiltration"),
+}
+
+_already_alerted = set()
+
+
+# ──────────────────────────────────────────────────────────
+# Configuration locale (créée au premier lancement, jamais
+# embarquée dans le code / l'exécutable)
+# ──────────────────────────────────────────────────────────
+def config_path():
+    if platform.system() == "Windows":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    folder = os.path.join(base, APP_NAME)
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "config.json")
+
+
+def load_config():
+    path = config_path()
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def save_config(server_url, api_key, agent_id):
+    with open(config_path(), "w", encoding="utf-8") as f:
+        json.dump({"server_url": server_url, "api_key": api_key, "agent_id": agent_id}, f)
+
+
+def first_run_setup():
+    """Petite fenêtre demandant l'URL du serveur, la clé API et le nom
+    d'affichage à saisir une seule fois. C'est la seule information que
+    ce poste connaîtra — jamais stockée dans le code partagé avec
+    d'autres clients."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    result = {}
+
+    def on_submit():
+        server = server_entry.get().strip()
+        key = key_entry.get().strip()
+        name = name_entry.get().strip() or socket.gethostname()
+        if not server or not key:
+            messagebox.showerror("Champs requis", "Merci de renseigner l'URL et la clé.")
+            return
+        result["server_url"] = server
+        result["api_key"] = key
+        result["agent_id"] = name
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Configuration NHGuard Agent")
+    root.geometry("380x270")
+    root.resizable(False, False)
+
+    tk.Label(root, text="Adresse du serveur EDR", anchor="w").pack(fill="x", padx=16, pady=(16, 2))
+    server_entry = tk.Entry(root, width=45)
+    server_entry.insert(0, "http://127.0.0.1:5000")
+    server_entry.pack(padx=16)
+
+    tk.Label(root, text="Clé API de votre organisation", anchor="w").pack(fill="x", padx=16, pady=(12, 2))
+    key_entry = tk.Entry(root, width=45, show="•")
+    key_entry.pack(padx=16)
+
+    tk.Label(root, text="Cette clé se trouve dans le dashboard EDR, page Agents.",
+             fg="#666", font=("Segoe UI", 8)).pack(padx=16, pady=(4, 0), anchor="w")
+
+    tk.Label(root, text="Nom de cette machine dans le dashboard", anchor="w").pack(fill="x", padx=16, pady=(12, 2))
+    name_entry = tk.Entry(root, width=45)
+    name_entry.insert(0, socket.gethostname())
+    name_entry.pack(padx=16)
+
+    tk.Label(root, text="Modifiable librement — n'affecte que l'affichage.",
+             fg="#666", font=("Segoe UI", 8)).pack(padx=16, pady=(4, 0), anchor="w")
+
+    tk.Button(root, text="Enregistrer et démarrer", command=on_submit).pack(pady=16)
+    root.mainloop()
+
+    if "api_key" not in result:
+        sys.exit(0)  # fenêtre fermée sans valider
+
+    save_config(result["server_url"], result["api_key"], result["agent_id"])
+    return {"server_url": result["server_url"], "api_key": result["api_key"], "agent_id": result["agent_id"]}
+
+
+def get_config():
+    cfg = load_config()
+    if cfg is None:
+        cfg = first_run_setup()
+    return cfg
+
+
+# ──────────────────────────────────────────────────────────
+# Collecte & envoi
+# ──────────────────────────────────────────────────────────
+def get_local_ip():
+    """Astuce classique : ouvre une connexion UDP factice pour connaître l'IP
+    locale réellement utilisée pour sortir sur le réseau (aucun paquet n'est
+    vraiment envoyé, 8.8.8.8 sert juste de cible de routage)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def get_logged_in_user():
+    try:
+        users = psutil.users()
+        return users[0].name if users else None
+    except Exception:
+        return None
+
+
+def get_top_processes(limit=25):
+    """Snapshot des processus les plus consommateurs (CPU puis RAM),
+    envoyé au serveur à chaque heartbeat pour affichage dans le dashboard."""
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent"]):
+        try:
+            info = p.info
+            procs.append({
+                "pid": info["pid"],
+                "name": info.get("name") or "?",
+                "user": (info.get("username") or "?").split("\\")[-1],
+                "cpu_percent": round(info.get("cpu_percent") or 0, 1),
+                "memory_percent": round(info.get("memory_percent") or 0, 1),
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    procs.sort(key=lambda x: (x["cpu_percent"], x["memory_percent"]), reverse=True)
+    return procs[:limit]
+
+
+def collect_system_stats(agent_id):
+    return {
+        "agent_id": agent_id,
+        "cpu_percent": psutil.cpu_percent(interval=1),
+        "ram_percent": psutil.virtual_memory().percent,
+        "disk_percent": psutil.disk_usage("/").percent if platform.system() != "Windows"
+                         else psutil.disk_usage("C:\\").percent,
+        "os": f"{platform.system()} {platform.release()}",
+        "process_count": len(psutil.pids()),
+        "cpu_model": platform.processor() or "Inconnu",
+        "ram_total_gb": round(psutil.virtual_memory().total / (1024 ** 3), 1),
+        "local_ip": get_local_ip(),
+        "logged_in_user": get_logged_in_user(),
+        "processes": get_top_processes(),
+    }
+
+
+def send_heartbeat(cfg, stats):
+    headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
+    try:
+        r = requests.post(f"{cfg['server_url']}/api/agents/report", json=stats, headers=headers, timeout=5)
+        if r.status_code == 401:
+            print("[!] Clé API rejetée par le serveur — vérifiez la configuration.")
+        elif r.status_code != 200:
+            print(f"[!] Erreur heartbeat ({r.status_code}) : {r.text}")
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable : {e}")
+
+
+def send_alert(cfg, title, description, severity, category):
+    headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
+    payload = {
+        "title": title, "description": description,
+        "severity": severity, "category": category, "agent_id": cfg["agent_id"],
+    }
+    try:
+        r = requests.post(f"{cfg['server_url']}/api/agents/alert", json=payload, headers=headers, timeout=5)
+        if r.status_code == 201:
+            print(f"[ALERTE ENVOYÉE] {title}")
+        else:
+            print(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable : {e}")
+
+
+def send_quarantine(cfg, file_path, reason, action, severity):
+    headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
+    payload = {
+        "file_path": file_path, "reason": reason, "action": action,
+        "severity": severity, "agent_id": cfg["agent_id"],
+    }
+    try:
+        r = requests.post(f"{cfg['server_url']}/api/agents/quarantine", json=payload, headers=headers, timeout=5)
+        if r.status_code == 201:
+            print(f"[QUARANTAINE] {file_path} ({action})")
+        else:
+            print(f"[!] Erreur envoi quarantaine ({r.status_code}) : {r.text}")
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable : {e}")
+
+
+def scan_processes(cfg):
+    for proc in psutil.process_iter(["pid", "name"]):
+        name = (proc.info.get("name") or "").lower()
+        if name in SUSPICIOUS_PROCESS_NAMES and name not in _already_alerted:
+            severity, category, description = SUSPICIOUS_PROCESS_NAMES[name]
+
+            # Récupère le chemin du fichier exécutable avant de tenter quoi que ce soit
+            try:
+                file_path = proc.exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                file_path = f"(chemin inaccessible, PID {proc.info['pid']})"
+
+            # Tentative de blocage : on arrête le processus. Le fichier lui-même
+            # n'est ni déplacé ni supprimé (pour éviter tout dégât en cas de
+            # faux positif) — seul le processus en cours d'exécution est stoppé.
+            action = "detected_only"
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+                action = "process_terminated"
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                pass  # pas les droits, ou déjà arrêté -> on garde "detected_only"
+
+            send_alert(cfg, f"Processus suspect détecté : {name}",
+                       f"{description} (PID {proc.info['pid']}) — {file_path}", severity, category)
+            send_quarantine(cfg, file_path, description, action, severity)
+
+            _already_alerted.add(name)
+
+
+def main():
+    cfg = get_config()
+    print("── Agent NHGuard démarré ──")
+    print(f"Identifiant : {cfg['agent_id']}")
+    print(f"Serveur     : {cfg['server_url']}")
+    print(f"Config      : {config_path()}")
+    print("Ctrl+C pour arrêter.\n")
+
+    while True:
+        stats = collect_system_stats(cfg["agent_id"])
+        send_heartbeat(cfg, stats)
+        scan_processes(cfg)
+        print(f"[{time.strftime('%H:%M:%S')}] CPU {stats['cpu_percent']}% · "
+              f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}%")
+        time.sleep(REPORT_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAgent arrêté.")
