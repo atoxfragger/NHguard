@@ -1,0 +1,127 @@
+"""
+Base de données des comptes et organisations de la console EDR (multi-tenant).
+
+Fichier SQLite indépendant du reste de l'application : edr_users.db.
+
+Modèle :
+  - Une "organization" = un client du SaaS (une entreprise)
+  - Chaque organisation a sa propre clé API agent (agent_api_key),
+    unique et générée automatiquement à la création
+  - Chaque "user" appartient à UNE organisation (org_id)
+  - Toutes les données EDR (agents, alertes) sont taguées par org_id
+    dans edr_data.db et filtrées en conséquence -> isolation totale
+    entre clients
+"""
+
+import sqlite3
+import time
+import secrets
+from contextlib import contextmanager
+
+DB_PATH = "edr_users.db"
+
+
+@contextmanager
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                agent_api_key  TEXT UNIQUE NOT NULL,
+                created_at     REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id         INTEGER NOT NULL REFERENCES organizations(id),
+                email          TEXT UNIQUE NOT NULL,
+                first_name     TEXT NOT NULL,
+                last_name      TEXT NOT NULL,
+                role           TEXT NOT NULL DEFAULT 'member',  -- 'admin' ou 'member'
+                password_hash  TEXT,              -- NULL si compte créé via Google
+                google_account INTEGER NOT NULL DEFAULT 0,
+                created_at     REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orgs_agent_key ON organizations(agent_api_key)")
+
+
+# ──────────────────────────────────────────────────────────
+# Organisations
+# ──────────────────────────────────────────────────────────
+def create_organization(name: str):
+    agent_api_key = secrets.token_hex(24)  # clé unique générée automatiquement
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO organizations (name, agent_api_key, created_at) VALUES (?, ?, ?)",
+            (name, agent_api_key, time.time()),
+        )
+        org_id = cur.lastrowid
+    return get_organization(org_id)
+
+
+def get_organization(org_id: int):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM organizations WHERE id = ?", (org_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_organization_by_agent_key(agent_api_key: str):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM organizations WHERE agent_api_key = ?", (agent_api_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def regenerate_agent_key(org_id: int):
+    new_key = secrets.token_hex(24)
+    with get_connection() as conn:
+        conn.execute("UPDATE organizations SET agent_api_key = ? WHERE id = ?", (new_key, org_id))
+    return new_key
+
+
+# ──────────────────────────────────────────────────────────
+# Utilisateurs
+# ──────────────────────────────────────────────────────────
+def get_user_by_email(email: str):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return dict(row) if row else None
+
+
+def user_exists(email: str) -> bool:
+    return get_user_by_email(email) is not None
+
+
+def create_user(org_id, email, first_name, last_name, password_hash,
+                 role="member", google_account=False):
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO users
+               (org_id, email, first_name, last_name, role, password_hash,
+                google_account, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                org_id, email, first_name, last_name, role, password_hash,
+                1 if google_account else 0, time.time(),
+            ),
+        )
+    return get_user_by_email(email)
