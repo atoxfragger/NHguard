@@ -1,0 +1,1686 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NHGuard — Console de sécurité</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* ── Reset & Variables ─────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --void:      #ffffff;
+    --panel:     #ffffff;
+    --grid-line: #e8edf2;
+    --bg0:      #ffffff;
+    --bg1:      #ffffff;
+    --bg2:      #f1f5f9;
+    --bg3:      #e2e8f0;
+    --bg4:      #cbd5e1;
+    --border:   #e2e8f0;
+    --text1:    #0f172a;
+    --text2:    #475569;
+    --text3:    #94a3b8;
+    --red:      #dc2626;
+    --orange:   #ea580c;
+    --yellow:   #ca8a04;
+    --green:    #16a34a;
+    --blue:     #2563eb;
+    --purple:   #7c3aed;
+    --teal:     #0d9488;
+    --red-bg:   rgba(220,38,38,.08);
+    --ora-bg:   rgba(234,88,12,.08);
+    --yel-bg:   rgba(202,138,4,.08);
+    --grn-bg:   rgba(22,163,74,.08);
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-ui:   'Inter', sans-serif;
+    --font-display: 'Space Grotesk', sans-serif;
+  }
+
+  html, body { height: 100%; background: var(--bg0); color: var(--text1); font-family: var(--font-ui); }
+
+  /* ── Scrollbar ─────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg1); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ── Layout ────────────────────────────────────────────── */
+  .shell { display: flex; height: 100vh; overflow: hidden; }
+
+  /* ── Sidebar ───────────────────────────────────────────── */
+  .sidebar {
+    width: 220px; flex-shrink: 0;
+    background: var(--bg1);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    padding: 0;
+  }
+  .logo {
+    padding: 20px 18px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo-icon {
+    width: 32px; height: 32px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--teal), var(--blue));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+  .logo-text { font-size: 15px; font-weight: 600; letter-spacing: .3px; }
+  .logo-sub  { font-size: 10px; color: var(--text3); font-family: var(--font-mono); margin-top: 1px; }
+
+  .nav { padding: 12px 8px; flex: 1; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 10px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; color: var(--text2); transition: all .15s;
+    margin-bottom: 2px; user-select: none;
+  }
+  .nav-item:hover  { background: var(--bg3); color: var(--text1); }
+  .nav-item.active { background: var(--bg4); color: var(--teal); }
+  .nav-icon { font-size: 15px; width: 18px; text-align: center; }
+
+  .badge {
+    margin-left: auto; font-size: 10px; font-family: var(--font-mono);
+    background: var(--red-bg); color: var(--red);
+    padding: 2px 6px; border-radius: 4px; font-weight: 500;
+  }
+  .badge.ok { background: var(--grn-bg); color: var(--green); }
+
+  /* ── Sidebar footer / user ─────────────────────────────── */
+  .sidebar-footer {
+    border-top: 1px solid var(--border);
+    padding: 12px 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .user-avatar {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--bg4); color: var(--teal);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-family: var(--font-mono); font-weight: 600;
+    flex-shrink: 0;
+  }
+  .user-name { font-size: 12px; color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .logout-btn {
+    background: none; border: 1px solid var(--border); color: var(--text3);
+    font-size: 11px; padding: 4px 8px; border-radius: 5px; cursor: pointer;
+    font-family: var(--font-mono); transition: all .15s;
+  }
+  .logout-btn:hover { background: var(--red-bg); color: var(--red); border-color: var(--red); }
+
+  /* ── Main ──────────────────────────────────────────────── */
+  .main {
+    flex: 1; overflow-y: auto;
+    display: flex; flex-direction: column;
+    background: var(--bg0);
+  }
+
+  /* ── Top bar ───────────────────────────────────────────── */
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--bg0); border-bottom: 1px solid var(--border);
+    padding: 14px 24px; display: flex; align-items: center; gap: 12px;
+  }
+  .topbar-title { font-size: 16px; font-weight: 600; }
+  .topbar-sub   { font-size: 12px; color: var(--text3); font-family: var(--font-mono); margin-top: 2px; }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--text1);
+    margin-left: auto;
+  }
+  .status-text { font-size: 12px; color: var(--text3); font-family: var(--font-mono); }
+
+  /* ── Content ───────────────────────────────────────────── */
+  .content { padding: 24px; flex: 1; }
+
+  /* ── KPI cards ─────────────────────────────────────────── */
+  .kpi-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr));
+    gap: 12px; margin-bottom: 24px;
+  }
+  .kpi {
+    background: var(--bg1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+    display: flex; flex-direction: column; gap: 4px;
+    transition: border-color .2s;
+  }
+  .kpi:hover { border-color: var(--bg4); }
+  .kpi-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: .8px; }
+  .kpi-val   { font-size: 28px; font-weight: 600; font-family: var(--font-mono); line-height: 1; }
+  .kpi-sub   { font-size: 11px; color: var(--text3); }
+  .kpi.red   { border-left: 3px solid var(--red);    } .kpi.red .kpi-val   { color: var(--red); }
+  .kpi.ora   { border-left: 3px solid var(--orange); } .kpi.ora .kpi-val   { color: var(--orange); }
+  .kpi.yel   { border-left: 3px solid var(--yellow); } .kpi.yel .kpi-val   { color: var(--yellow); }
+  .kpi.grn   { border-left: 3px solid var(--green);  } .kpi.grn .kpi-val   { color: var(--green); }
+  .kpi.blu   { border-left: 3px solid var(--blue);   } .kpi.blu .kpi-val   { color: var(--blue); }
+  .kpi.pur   { border-left: 3px solid var(--purple); } .kpi.pur .kpi-val   { color: var(--purple); }
+
+  /* ── Section title ─────────────────────────────────────── */
+  .section-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .section-title { font-size: 13px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: .8px; }
+  .refresh-btn {
+    font-size: 11px; color: var(--text3); background: none; border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 5px; cursor: pointer; font-family: var(--font-mono);
+    transition: all .15s;
+  }
+  .refresh-btn:hover { background: var(--bg3); color: var(--text1); }
+
+  /* ── Alerts table ──────────────────────────────────────── */
+  .alerts-panel {
+    background: var(--bg1); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; margin-bottom: 24px;
+  }
+  .alert-filters {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+  .filter-btn {
+    font-size: 11px; padding: 4px 10px; border-radius: 5px; cursor: pointer;
+    border: 1px solid var(--border); background: none; color: var(--text3);
+    font-family: var(--font-mono); transition: all .15s; user-select: none;
+  }
+  .filter-btn:hover { background: var(--bg3); color: var(--text1); }
+  .filter-btn.active { background: var(--bg4); color: var(--text1); border-color: var(--bg4); }
+  .filter-btn.f-crit.active { background: var(--red-bg);  color: var(--red);    border-color: var(--red); }
+  .filter-btn.f-high.active { background: var(--ora-bg);  color: var(--orange); border-color: var(--orange); }
+  .filter-btn.f-med.active  { background: var(--yel-bg);  color: var(--yellow); border-color: var(--yellow); }
+  .filter-btn.f-low.active  { background: var(--grn-bg);  color: var(--green);  border-color: var(--green); }
+
+  .alerts-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .alerts-table th {
+    padding: 10px 16px; text-align: left; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .8px; color: var(--text3);
+    border-bottom: 1px solid var(--border); font-weight: 500; background: var(--bg1);
+    position: sticky; top: 0;
+  }
+  .alerts-table td { padding: 10px 16px; border-bottom: 1px solid rgba(42,52,68,.5); vertical-align: middle; }
+  .alerts-table tr:hover td { background: var(--bg2); }
+  .alerts-table tr:last-child td { border-bottom: none; }
+
+  .sev {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; font-family: var(--font-mono); font-weight: 500;
+    padding: 2px 7px; border-radius: 4px; text-transform: uppercase; white-space: nowrap;
+  }
+  .sev::before { content:''; width:6px; height:6px; border-radius:50%; display:inline-block; }
+  .sev-critical { background: var(--red-bg);  color: var(--red);    } .sev-critical::before { background: var(--red); }
+  .sev-high     { background: var(--ora-bg);  color: var(--orange); } .sev-high::before     { background: var(--orange); }
+  .sev-medium   { background: var(--yel-bg);  color: var(--yellow); } .sev-medium::before   { background: var(--yellow); }
+  .sev-low      { background: var(--grn-bg);  color: var(--green);  } .sev-low::before      { background: var(--green); }
+
+  .score-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 5px;
+    font-size: 11px; font-weight: 700; font-family: var(--font-mono);
+  }
+  .score-critical { background: var(--red);    color: #2a0a0a; }
+  .score-high     { background: var(--orange); color: #2a1a05; }
+  .score-medium   { background: var(--yellow); color: #2a2205; }
+  .score-low      { background: var(--green);  color: #052a0f; }
+
+  .cat { font-size: 10px; color: var(--text3); font-family: var(--font-mono); }
+  .agent-pill {
+    font-size: 10px; font-family: var(--font-mono);
+    background: var(--bg3); color: var(--blue);
+    padding: 2px 7px; border-radius: 4px; border: 1px solid var(--border);
+  }
+  .ts { font-size: 10px; color: var(--text3); font-family: var(--font-mono); }
+  .ack-btn {
+    font-size: 10px; padding: 3px 8px; border-radius: 4px; cursor: pointer;
+    border: 1px solid var(--border); background: none; color: var(--text3);
+    font-family: var(--font-mono); transition: all .15s;
+  }
+  .ack-btn:hover { background: var(--grn-bg); color: var(--green); border-color: var(--green); }
+  .empty { padding: 48px; text-align: center; color: var(--text3); font-size: 13px; }
+
+  /* ── Bottom grid ───────────────────────────────────────── */
+  .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+  /* ── Agents panel ──────────────────────────────────────── */
+  .panel {
+    background: var(--bg1); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+  }
+  .panel-head {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; color: var(--text2);
+    text-transform: uppercase; letter-spacing: .8px;
+  }
+  .agent-row {
+    padding: 11px 16px; border-bottom: 1px solid rgba(42,52,68,.5);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .agent-row:last-child { border-bottom: none; }
+  .agent-status { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .agent-status.active  { background: var(--green); box-shadow: 0 0 5px var(--green); }
+  .agent-status.offline { background: var(--text3); }
+  .agent-name { font-size: 12px; font-family: var(--font-mono); font-weight: 500; flex: 1; }
+  .agent-meta { font-size: 10px; color: var(--text3); font-family: var(--font-mono); }
+  .mini-bar-wrap { flex: 1; height: 4px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+  .mini-bar { height: 100%; border-radius: 2px; transition: width .5s; }
+
+  /* ── Category chart ────────────────────────────────────── */
+  .cat-list { padding: 12px 16px; }
+  .cat-row { margin-bottom: 12px; }
+  .cat-row-head { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 11px; }
+  .cat-name { color: var(--text2); }
+  .cat-num  { color: var(--text3); font-family: var(--font-mono); }
+  .bar-track { height: 5px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .bar-fill  { height: 100%; border-radius: 3px; transition: width .6s; }
+
+  /* ── Demo banner ───────────────────────────────────────── */
+  .demo-banner {
+    margin: 0 24px 16px;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px;
+    display: flex; align-items: center; gap: 12px;
+    font-size: 12px; color: var(--text2);
+  }
+  .demo-btn {
+    margin-left: auto; font-size: 11px; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--teal); background: rgba(45,212,191,.1); color: var(--teal);
+    cursor: pointer; font-family: var(--font-mono); transition: all .15s;
+  }
+  .demo-btn:hover { background: rgba(45,212,191,.2); }
+
+  /* ── Spinner ───────────────────────────────────────────── */
+  .spin { display:inline-block; animation: spin .6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Toast ─────────────────────────────────────────────── */
+  #toast {
+    position: fixed; bottom: 20px; right: 20px; z-index: 999;
+    background: var(--bg3); border: 1px solid var(--border);
+    padding: 10px 16px; border-radius: 8px; font-size: 12px;
+    opacity: 0; transform: translateY(10px);
+    transition: all .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+
+  /* ── Login screen (2FA) — même scène 3D que register.html ── */
+  #login-screen { position: fixed; inset: 0; z-index: 500; }
+  #login-screen.hidden { display: none; }
+
+  .scene {
+    position: fixed; inset: 0; z-index: 0; overflow: hidden;
+    background: radial-gradient(ellipse 80% 55% at 50% 28%, #f4f7f9 0%, var(--void) 68%);
+  }
+  .horizon {
+    position: absolute; left: 0; right: 0; top: 30%; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(45,212,191,.55), transparent);
+    filter: blur(.5px);
+  }
+  .grid-floor {
+    position: absolute; left: -60%; right: -60%; bottom: -6%; height: 62%;
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 46px 46px;
+    transform: perspective(600px) rotateX(78deg);
+    transform-origin: bottom;
+    -webkit-mask-image: linear-gradient(to top, black 15%, transparent 92%);
+            mask-image: linear-gradient(to top, black 15%, transparent 92%);
+    opacity: .8;
+  }
+  .radar-sweep {
+    position: absolute; left: 50%; top: 30%; width: 1400px; height: 1400px;
+    margin-left: -700px; margin-top: -20px;
+    background: conic-gradient(from 0deg, rgba(45,212,191,.16), transparent 20%);
+    border-radius: 50%; mix-blend-mode: screen;
+    animation: sweep 9s linear infinite; opacity: .5;
+  }
+  @keyframes sweep { to { transform: rotate(360deg); } }
+
+  .node { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: var(--teal); opacity: .5; animation: drift 7s ease-in-out infinite; }
+  .node:nth-child(1) { top: 18%; left: 12%; animation-delay: 0s; }
+  .node:nth-child(2) { top: 62%; left: 82%; animation-delay: 1.4s; background: var(--blue); }
+  .node:nth-child(3) { top: 40%; left: 88%; animation-delay: 2.8s; }
+  .node:nth-child(4) { top: 74%; left: 8%;  animation-delay: 4.2s; background: var(--blue); }
+  .node:nth-child(5) { top: 12%; left: 70%; animation-delay: 5.6s; }
+  @keyframes drift { 0%,100% { transform: translateY(0); opacity: .35; } 50% { transform: translateY(-10px); opacity: .8; } }
+
+  .stage {
+    position: relative; z-index: 1; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 40px 20px; perspective: 1100px;
+  }
+  .tilt { transform-style: preserve-3d; transition: transform .25s ease-out; width: 100%; max-width: 360px; }
+
+  .shield-3d { width: 62px; height: 62px; margin: 0 auto 22px; perspective: 500px; transform: translateZ(30px); }
+  .shield-3d-inner { position: relative; width: 100%; height: 100%; transform-style: preserve-3d; animation: shieldSpin 11s linear infinite; }
+  .shield-face { position: absolute; inset: 0; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); }
+  .shield-face.front { background: linear-gradient(135deg, var(--teal), var(--blue)); transform: translateZ(9px); }
+  .shield-face.back  { background: var(--panel); border: 1px solid rgba(45,212,191,.5); transform: translateZ(-9px) rotateY(180deg); }
+  .shield-ring { position: absolute; inset: -12px; border: 1px solid rgba(45,212,191,.28); border-radius: 50%; transform: rotateX(72deg); animation: ringSpin 6s linear infinite reverse; }
+  @keyframes shieldSpin { to { transform: rotateY(360deg); } }
+  @keyframes ringSpin { to { transform: rotateX(72deg) rotateZ(360deg); } }
+
+  /* Variante miniature du bouclier 3D, pour le logo de la sidebar */
+  .shield-3d-mini { width: 32px; height: 32px; margin: 0; perspective: 300px; transform: none; flex-shrink: 0; }
+  .shield-3d-mini .shield-face.front { transform: translateZ(5px); }
+  .shield-3d-mini .shield-face.back  { transform: translateZ(-5px) rotateY(180deg); }
+  .shield-3d-mini .shield-ring { inset: -6px; }
+
+  .login-card {
+    position: relative;
+    background: rgba(255,255,255,.9);
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--border);
+    border-radius: 14px; padding: 30px 26px;
+    box-shadow: 0 30px 60px -20px rgba(15,23,42,.18), 0 0 0 1px rgba(13,148,136,.04);
+  }
+  .login-card::before, .login-card::after, .login-corner-bl, .login-corner-br {
+    content: ''; position: absolute; width: 16px; height: 16px;
+    border-color: rgba(45,212,191,.55); border-style: solid; border-width: 0;
+    pointer-events: none;
+  }
+  .login-card::before { top: -1px; left: -1px; border-top-width: 2px; border-left-width: 2px; border-radius: 4px 0 0 0; }
+  .login-card::after  { top: -1px; right: -1px; border-top-width: 2px; border-right-width: 2px; border-radius: 0 4px 0 0; }
+  .login-corner-bl { bottom: -1px; left: -1px; border-bottom-width: 2px; border-left-width: 2px; border-radius: 0 0 0 4px; }
+  .login-corner-br { bottom: -1px; right: -1px; border-bottom-width: 2px; border-right-width: 2px; border-radius: 0 0 4px 0; }
+
+  .login-head { text-align: center; margin-bottom: 22px; }
+  .login-title {
+    display: inline-block; font-family: var(--font-display); font-size: 22px; font-weight: 700;
+    letter-spacing: .5px;
+    background: linear-gradient(135deg, var(--teal), var(--blue));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+
+  .login-step { display: none; }
+  .login-step.active { display: block; }
+
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block; font-size: 10.5px; color: var(--text2); font-family: var(--font-mono);
+    margin-bottom: 5px; text-transform: uppercase; letter-spacing: .6px;
+  }
+  .field input {
+    width: 100%; background: var(--bg2); border: 1px solid var(--border);
+    color: var(--text1); font-family: var(--font-ui); font-size: 13px;
+    padding: 9px 11px; border-radius: 7px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .field input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(45,212,191,.12); }
+  .field input.otp-input {
+    font-family: var(--font-mono); letter-spacing: 6px; font-size: 18px;
+    text-align: center; padding: 10px;
+  }
+
+  .login-btn {
+    width: 100%; padding: 11px; border-radius: 7px; border: none;
+    background: linear-gradient(135deg, var(--teal), var(--blue));
+    color: #04141a; font-weight: 700; font-size: 13px; cursor: pointer;
+    transition: filter .15s, transform .1s; margin-top: 4px;
+  }
+  .login-btn:hover { filter: brightness(1.08); }
+  .login-btn:active { transform: translateY(1px); }
+  .login-btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+
+  .login-error {
+    background: var(--red-bg); color: var(--red); font-size: 12px;
+    padding: 8px 10px; border-radius: 6px; margin-bottom: 14px; display: none;
+  }
+  .login-error.show { display: block; }
+
+  .login-back {
+    display: inline-block; margin-top: 14px; font-size: 11px;
+    color: var(--text3); cursor: pointer; font-family: var(--font-mono);
+  }
+  .login-back:hover { color: var(--text2); }
+
+  .login-hint {
+    font-size: 11px; color: var(--text3); margin-top: 12px; line-height: 1.5;
+  }
+
+  /* ── Divider + bouton Google ───────────────────────────── */
+  .divider {
+    display: flex; align-items: center; gap: 10px;
+    margin: 16px 0; font-size: 11px; color: var(--text3); font-family: var(--font-mono);
+  }
+  .divider::before, .divider::after {
+    content: ''; flex: 1; height: 1px; background: var(--border);
+  }
+  #google-btn-container {
+    display: flex; justify-content: center;
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Écran de connexion (2FA) ──────────────────────────── -->
+<div id="login-screen">
+  <div class="scene" aria-hidden="true">
+    <div class="horizon"></div>
+    <div class="grid-floor"></div>
+    <div class="radar-sweep"></div>
+    <div class="node"></div><div class="node"></div><div class="node"></div><div class="node"></div><div class="node"></div>
+  </div>
+
+  <div class="stage">
+    <div class="tilt" id="login-tilt">
+
+      <div class="shield-3d">
+        <div class="shield-3d-inner">
+          <div class="shield-face front"></div>
+          <div class="shield-face back"></div>
+          <div class="shield-ring"></div>
+        </div>
+      </div>
+
+      <div class="login-card">
+        <div class="login-corner-bl"></div><div class="login-corner-br"></div>
+        <div class="login-head">
+          <div class="login-title">NHGuard</div>
+        </div>
+
+        <div class="login-error" id="login-error"></div>
+
+        <!-- Étape 1 : identifiants -->
+        <form id="step-credentials" class="login-step active" autocomplete="off">
+          <div class="field">
+            <label for="login-user">Identifiant</label>
+            <input id="login-user" type="text" autocomplete="username" required>
+          </div>
+          <div class="field">
+            <label for="login-pass">Mot de passe</label>
+            <input id="login-pass" type="password" autocomplete="current-password" required>
+          </div>
+          <button type="submit" class="login-btn" id="btn-step1">Continuer</button>
+        </form>
+
+        <div class="divider" id="google-divider">ou</div>
+        <div id="google-btn-container"></div>
+
+        <!-- Étape 2 : code à 6 chiffres envoyé par email -->
+        <form id="step-otp" class="login-step" autocomplete="off">
+          <div class="field">
+            <label for="login-otp">Code de vérification</label>
+            <input id="login-otp" class="otp-input" type="text" inputmode="numeric" maxlength="6" placeholder="000000" required>
+          </div>
+          <button type="submit" class="login-btn" id="btn-step2">Vérifier</button>
+          <div class="login-hint">Un code à 6 chiffres a été envoyé à votre adresse email. Il expire dans 5 minutes.</div>
+          <span class="login-back" onclick="resendCode()" id="resend-link">Renvoyer le code</span>
+          <span class="login-back" onclick="goToStep('credentials')" style="margin-left:14px">← Retour</span>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+
+
+<div class="shell" id="app-shell" style="display:none">
+
+  <!-- ── Sidebar ─────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="shield-3d shield-3d-mini">
+        <div class="shield-3d-inner">
+          <div class="shield-face front"></div>
+          <div class="shield-face back"></div>
+          <div class="shield-ring"></div>
+        </div>
+      </div>
+      <div>
+        <div class="logo-text">NHGuard</div>
+        <div class="logo-sub"></div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" onclick="setPage('dashboard')">
+        <span class="nav-icon"></span> Dashboard
+      </div>
+      <div class="nav-item" onclick="setPage('alerts')">
+        <span class="nav-icon"></span> Alertes
+      </div>
+      <div class="nav-item" onclick="setPage('agents')">
+        <span class="nav-icon"></span> Agents
+      </div>
+      <div class="nav-item" onclick="setPage('quarantine')">
+        <span class="nav-icon"></span> Quarantaine
+      </div>
+      <div class="nav-item" onclick="setPage('investigate')">
+        <span class="nav-icon"></span> Investigate
+      </div>
+      <div class="nav-item" onclick="setPage('history')">
+        <span class="nav-icon"></span> Historique
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="user-avatar" id="user-avatar">?</div>
+      <div class="user-name" id="user-name">—</div>
+      <button class="logout-btn" onclick="logout()">Déconnexion</button>
+    </div>
+  </aside>
+
+  <!-- ── Main ────────────────────────────────────────────── -->
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <div class="topbar-title" id="page-title">Dashboard</div>
+        <div class="topbar-sub" id="page-sub">Dernière actualisation : —</div>
+      </div>
+      <div class="status-dot" id="status-dot"></div>
+      <div class="status-text" id="status-text">Connexion…</div>
+    </div>
+
+    <!-- Demo banner -->
+    <div class="demo-banner" id="demo-banner">
+      
+      <span id="demo-banner-text">Aucun agent connecté ? Injecte des données de démo pour visualiser le dashboard.</span>
+      <button class="demo-btn" onclick="seedDemo()" id="demo-btn">Charger démo</button>
+      <button class="demo-btn" onclick="clearDemo()" id="clear-demo-btn" style="display:none;border-color:var(--red);background:rgba(248,113,113,.1);color:var(--red)">Effacer la démo</button>
+    </div>
+
+    <div class="content" id="content">
+      <div class="empty">Chargement…</div>
+    </div>
+  </main>
+</div>
+<div id="toast"></div>
+
+<script>
+// Même origine que la page servie : fonctionne automatiquement en
+// local (127.0.0.1), sur le réseau (192.168.x.x) ou via un tunnel
+// public (ngrok, Cloudflare Tunnel...), sans rien à modifier ici.
+const API = window.location.origin;
+let currentPage = 'dashboard';
+let currentFilter = 'all';
+let refreshTimer;
+
+// ── Inclinaison 3D du panneau de connexion au mouvement de la souris ──
+(function () {
+  const tilt = document.getElementById('login-tilt');
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const hasHover = window.matchMedia('(hover: hover)').matches;
+  if (reduceMotion || !hasHover || !tilt) return;
+
+  document.addEventListener('mousemove', (e) => {
+    if (document.getElementById('login-screen').classList.contains('hidden')) return;
+    const relX = (e.clientX / window.innerWidth - 0.5) * 2;
+    const relY = (e.clientY / window.innerHeight - 0.5) * 2;
+    tilt.style.transform = `rotateY(${relX * 4}deg) rotateX(${-relY * 4}deg)`;
+  });
+})();
+
+// ══════════════════════════════════════════════════════════
+//  AUTHENTIFICATION (2 facteurs)
+// ══════════════════════════════════════════════════════════
+// Le token de session est conservé en mémoire d'onglet (sessionStorage) :
+// il est effacé à la fermeture de l'onglet et n'est jamais persistant.
+let sessionToken = sessionStorage.getItem('edr_token') || null;
+let tempToken     = null; // jeton temporaire entre l'étape 1 (mot de passe) et l'étape 2 (code)
+let currentUser   = sessionStorage.getItem('edr_user') || null;
+let currentOrg    = null;
+
+function showLoginError(msg) {
+  const el = document.getElementById('login-error');
+  el.textContent = msg;
+  el.classList.add('show');
+}
+function clearLoginError() {
+  document.getElementById('login-error').classList.remove('show');
+}
+function goToStep(step) {
+  clearLoginError();
+  document.querySelectorAll('.login-step').forEach(s => s.classList.remove('active'));
+  document.getElementById(`step-${step}`).classList.add('active');
+  const showGoogle = step === 'credentials';
+  document.getElementById('google-divider').style.display = showGoogle ? 'flex' : 'none';
+  document.getElementById('google-btn-container').style.display = showGoogle ? 'flex' : 'none';
+  if (step === 'otp') document.getElementById('login-otp').focus();
+}
+function showLogin() {
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('app-shell').style.display = 'none';
+  goToStep('credentials');
+  document.getElementById('login-user').focus();
+}
+function showApp() {
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('app-shell').style.display = 'flex';
+  if (currentUser) {
+    document.getElementById('user-name').textContent = currentUser;
+    document.getElementById('user-avatar').textContent = currentUser.slice(0,2).toUpperCase();
+  }
+  if (currentOrg) {
+    document.querySelector('.logo-sub').textContent = currentOrg;
+  }
+  loadPage();
+}
+
+// Étape 1 : vérification du mot de passe → déclenche la demande de code 2FA
+document.getElementById('step-credentials').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearLoginError();
+  const btn = document.getElementById('btn-step1');
+  btn.disabled = true; btn.textContent = 'Vérification…';
+
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+
+  try {
+    const res = await fetch(`${API}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+
+    if (res.ok && data.requires_2fa) {
+      tempToken = data.temp_token;
+      currentUser = username;
+      goToStep('otp');
+    } else if (res.ok && data.session_token) {
+      // au cas où le compte n'a pas la 2FA activée (non recommandé)
+      sessionToken = data.session_token;
+      sessionStorage.setItem('edr_token', sessionToken);
+      sessionStorage.setItem('edr_user', username);
+      currentUser = username;
+      showApp();
+    } else {
+      showLoginError(data.error || 'Identifiants invalides');
+    }
+  } catch (err) {
+    showLoginError('Serveur inaccessible — lance edr_server.py');
+  }
+  btn.disabled = false; btn.textContent = 'Continuer';
+});
+
+// Étape 2 : vérification du code TOTP → ouvre la session
+document.getElementById('step-otp').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearLoginError();
+  const btn = document.getElementById('btn-step2');
+  btn.disabled = true; btn.textContent = 'Vérification…';
+
+  const code = document.getElementById('login-otp').value.trim();
+
+  try {
+    const res = await fetch(`${API}/api/verify-2fa`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ temp_token: tempToken, code })
+    });
+    const data = await res.json();
+
+    if (res.ok && data.session_token) {
+      sessionToken = data.session_token;
+      sessionStorage.setItem('edr_token', sessionToken);
+      sessionStorage.setItem('edr_user', currentUser);
+      document.getElementById('login-otp').value = '';
+      showApp();
+    } else {
+      showLoginError(data.error || 'Code invalide');
+      document.getElementById('login-otp').value = '';
+    }
+  } catch (err) {
+    showLoginError('Serveur inaccessible — lance edr_server.py');
+  }
+  btn.disabled = false; btn.textContent = 'Vérifier';
+});
+
+// ══════════════════════════════════════════════════════════
+//  CONNEXION AVEC GOOGLE (OAuth)
+// ══════════════════════════════════════════════════════════
+// Remplacez cette valeur par le Client ID OAuth créé dans
+// Google Cloud Console (console.cloud.google.com > Identifiants).
+// N'oubliez pas d'ajouter l'origine de votre site dans
+// "Origines JavaScript autorisées".
+const GOOGLE_CLIENT_ID = '652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleusercontent.com';
+
+window.addEventListener('load', () => {
+  if (!window.google || GOOGLE_CLIENT_ID.startsWith('VOTRE_CLIENT_ID')) return;
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleGoogleCredential
+  });
+  google.accounts.id.renderButton(
+    document.getElementById('google-btn-container'),
+    { theme: 'filled_black', size: 'large', shape: 'pill', width: 300, text: 'continue_with' }
+  );
+});
+
+async function handleGoogleCredential(response) {
+  clearLoginError();
+  try {
+    const res = await fetch(`${API}/api/auth/google`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential: response.credential })
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showLoginError(data.error || 'Connexion Google refusée');
+      return;
+    }
+
+    currentUser = data.email;
+    tempToken = data.temp_token;
+    // Un code de vérification vient d'être envoyé par email -> étape 2
+    goToStep('otp');
+  } catch (err) {
+    showLoginError('Serveur inaccessible — lance edr_server.py');
+  }
+}
+
+async function resendCode() {
+  const link = document.getElementById('resend-link');
+  link.textContent = 'Envoi…';
+  try {
+    const res = await fetch(`${API}/api/resend-2fa`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ temp_token: tempToken })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      tempToken = data.temp_token;
+      toast('Nouveau code envoyé par email');
+    } else {
+      showLoginError(data.error || "Impossible de renvoyer le code");
+    }
+  } catch {
+    showLoginError('Serveur inaccessible — lance edr_server.py');
+  }
+  link.textContent = 'Renvoyer le code';
+}
+
+function logout() {
+  sessionToken = null;
+  currentUser = null;
+  sessionStorage.removeItem('edr_token');
+  sessionStorage.removeItem('edr_user');
+  clearTimeout(refreshTimer);
+  document.getElementById('login-user').value = '';
+  document.getElementById('login-pass').value = '';
+  showLogin();
+}
+
+// Wrapper fetch authentifié : ajoute le token, gère l'expiration de session
+async function authFetch(url, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, {
+    'Authorization': `Bearer ${sessionToken}`
+  });
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    toast('Session expirée, reconnecte-toi', false);
+    logout();
+    throw new Error('unauthorized');
+  }
+  return res;
+}
+
+// Vérifie si un token existant est encore valide au chargement de la page
+async function checkExistingSession() {
+  if (!sessionToken) { showLogin(); return; }
+  try {
+    const res = await fetch(`${API}/api/me`, {
+      headers: { 'Authorization': `Bearer ${sessionToken}` }
+    });
+    if (res.ok) {
+      const me = await res.json();
+      currentOrg = me.organization;
+      showApp();
+    } else { logout(); }
+  } catch {
+    // Serveur injoignable : on retente l'affichage de l'app, loadPage() gèrera l'erreur
+    showApp();
+  }
+}
+
+// ── Utilitaires ──────────────────────────────────────────
+const $ = id => document.getElementById(id);
+function ts(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso + 'Z');
+  return d.toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+       + ' ' + d.toLocaleDateString('fr-FR', { day:'2-digit', month:'2-digit' });
+}
+function clamp(v, min, max) { return Math.min(max, Math.max(min, v)); }
+function toast(msg, ok=true) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.color = ok ? 'var(--green)' : 'var(--red)';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+function setStatus(online) {
+  const dot  = $('status-dot');
+  const text = $('status-text');
+  dot.style.background = online ? 'var(--text1)' : 'var(--border)';
+  dot.style.boxShadow  = 'none';
+  text.textContent = '';
+}
+
+// ── Navigation ───────────────────────────────────────────
+function setPage(p) {
+  currentPage = p;
+  document.querySelectorAll('.nav-item').forEach((el,i) => {
+    el.classList.toggle('active', ['dashboard','alerts','agents','quarantine','investigate','history'][i] === p);
+  });
+  const titles = { dashboard:'Dashboard', alerts:'Alertes', agents:'Agents', quarantine:'Quarantaine', investigate:'Investigate', history:'Historique' };
+  $('page-title').textContent = titles[p];
+  clearTimeout(refreshTimer);
+  loadPage();
+}
+
+// ── Seed démo ─────────────────────────────────────────────
+async function seedDemo() {
+  const btn = $('demo-btn');
+  btn.textContent = 'Chargement…';
+  try {
+    const r = await authFetch(`${API}/api/demo/seed`, { method:'POST' });
+    if (r.ok) { toast('Données de démo chargées !'); loadPage(); }
+    else       { toast('Erreur lors du chargement', false); }
+  } catch { toast('Serveur inaccessible — lance edr_server.py', false); }
+  btn.textContent = 'Charger démo';
+}
+
+async function clearDemo() {
+  const btn = $('clear-demo-btn');
+  btn.textContent = 'Suppression…';
+  try {
+    const r = await authFetch(`${API}/api/demo/clear`, { method:'POST' });
+    if (r.ok) { toast('Données de démo effacées'); loadPage(); }
+    else       { toast('Erreur', false); }
+  } catch { toast('Serveur inaccessible — lance edr_server.py', false); }
+  btn.textContent = 'Effacer la démo';
+}
+
+// Met à jour la bannière démo (visible sur toutes les pages, pas
+// seulement le Dashboard) en fonction de l'état réel des données.
+async function updateDemoBanner() {
+  try {
+    const stats = await authFetch(`${API}/api/stats`).then(r => r.json());
+    const banner = $('demo-banner');
+    const clearBtn = $('clear-demo-btn');
+    const text = $('demo-banner-text');
+    if (!banner) return;
+
+    if (stats.agents_reels > 0) {
+      // Au moins un vrai agent -> la bannière ne sert plus à rien
+      banner.style.display = 'none';
+    } else {
+      banner.style.display = 'flex';
+      text.textContent = stats.a_des_donnees_demo
+        ? "Vous visualisez des données de DÉMO, pas votre vraie machine."
+        : "Aucun agent connecté ? Injecte des données de démo pour visualiser le dashboard.";
+      clearBtn.style.display = stats.a_des_donnees_demo ? 'inline-block' : 'none';
+    }
+  } catch { /* silencieux : le reste de loadPage affichera déjà l'erreur serveur */ }
+}
+
+// ── Acquitter une alerte ─────────────────────────────────
+async function ack(id) {
+  try {
+    await authFetch(`${API}/api/alerts/${id}/ack`, { method:'POST' });
+    const row = document.querySelector(`tr[data-id="${id}"]`);
+    if (row) { row.style.opacity = '.3'; row.style.transition = 'opacity .3s'; }
+    setTimeout(loadPage, 400);
+    toast('Alerte acquittée');
+  } catch { toast('Erreur', false); }
+}
+
+// ══════════════════════════════════════════════════════════
+//  PAGES
+// ══════════════════════════════════════════════════════════
+async function loadPage() {
+  $('page-sub').textContent = `Actualisation : ${new Date().toLocaleTimeString('fr-FR')}`;
+  const content = $('content');
+  _agentsIndex = null; // rafraîchit le cache d'infos agents utilisé par le panneau de détails
+
+  try {
+    updateDemoBanner(); // sur toutes les pages, sans bloquer le reste
+    if (currentPage === 'dashboard') await renderDashboard(content);
+    if (currentPage === 'alerts')    await renderAlerts(content);
+    if (currentPage === 'agents')    await renderAgents(content);
+    if (currentPage === 'quarantine') await renderQuarantine(content);
+    if (currentPage === 'investigate') await renderInvestigate(content);
+    if (currentPage === 'history') await renderHistory(content);
+    setStatus(true);
+  } catch (e) {
+    setStatus(false);
+    if (e.message !== 'unauthorized') {
+      content.innerHTML = `<div class="empty">Impossible de contacter le serveur.<br><br>Lance d'abord : <code style="color:var(--teal)">python edr_server.py</code></div>`;
+    }
+  }
+
+  refreshTimer = setTimeout(loadPage, 5000); // Auto-refresh toutes les 5s
+}
+
+// ── DASHBOARD ────────────────────────────────────────────
+async function renderDashboard(el) {
+  const [stats, alerts, agents] = await Promise.all([
+    authFetch(`${API}/api/stats`).then(r=>r.json()),
+    authFetch(`${API}/api/alerts?limit=10`).then(r=>r.json()),
+    authFetch(`${API}/api/agents`).then(r=>r.json()),
+  ]);
+
+  // Badges nav supprimés de l'interface
+
+  const maxCat = Math.max(1, ...Object.values(stats.par_categorie || {}));
+  const catColors = ['var(--red)','var(--orange)','var(--yellow)','var(--blue)','var(--purple)','var(--teal)','var(--green)','var(--text2)'];
+
+  el.innerHTML = `
+    <!-- KPIs -->
+    <div class="kpi-grid">
+      <div class="kpi red">  <div class="kpi-label">Critique</div>  <div class="kpi-val">${stats.critical||0}</div>  <div class="kpi-sub">alertes actives</div></div>
+      <div class="kpi ora">  <div class="kpi-label">Haute</div>     <div class="kpi-val">${stats.high||0}</div>     <div class="kpi-sub">alertes actives</div></div>
+      <div class="kpi yel">  <div class="kpi-label">Moyenne</div>   <div class="kpi-val">${stats.medium||0}</div>   <div class="kpi-sub">alertes actives</div></div>
+      <div class="kpi grn">  <div class="kpi-label">Agents</div>    <div class="kpi-val">${stats.agents_actifs||0}</div> <div class="kpi-sub">en ligne</div></div>
+      <div class="kpi blu">  <div class="kpi-label">Total</div>     <div class="kpi-val">${stats.total||0}</div>    <div class="kpi-sub">alertes</div></div>
+      <div class="kpi pur">  <div class="kpi-label">24h</div>       <div class="kpi-val">${stats.last_24h||0}</div> <div class="kpi-sub">dernières heures</div></div>
+    </div>
+
+    <!-- Dernières alertes -->
+    <div class="section-head">
+      <div class="section-title">Dernières alertes</div>
+      <button class="refresh-btn" onclick="loadPage()">Rafraîchir</button>
+    </div>
+    ${renderAlertsTable(alerts.slice(0,10))}
+
+    <!-- Bottom grid -->
+    <div class="bottom-grid" style="margin-top:24px">
+      <!-- Agents -->
+      <div class="panel">
+        <div class="panel-head">Agents connectés</div>
+        ${agents.slice(0,8).map(a => `
+          <div class="agent-row">
+            <div class="agent-status ${a.status}"></div>
+            <div class="agent-name">${a.agent_id}</div>
+            <div style="width:80px">
+              <div class="agent-meta" style="margin-bottom:2px">${Math.round(a.cpu_percent||0)}% CPU</div>
+              <div class="mini-bar-wrap">
+                <div class="mini-bar" style="width:${clamp(a.cpu_percent||0,0,100)}%;background:${(a.cpu_percent||0)>80?'var(--red)':(a.cpu_percent||0)>60?'var(--orange)':'var(--green)'}"></div>
+              </div>
+            </div>
+          </div>`).join('') || '<div class="empty" style="padding:24px">Aucun agent connecté</div>'}
+      </div>
+
+      <!-- Catégories -->
+      <div class="panel">
+        <div class="panel-head">Alertes par catégorie</div>
+        <div class="cat-list">
+          ${Object.entries(stats.par_categorie||{}).map(([cat,n],i) => `
+            <div class="cat-row">
+              <div class="cat-row-head">
+                <span class="cat-name">${cat.replace(/_/g,' ')}</span>
+                <span class="cat-num">${n}</span>
+              </div>
+              <div class="bar-track">
+                <div class="bar-fill" style="width:${Math.round(n/maxCat*100)}%;background:${catColors[i%catColors.length]}"></div>
+              </div>
+            </div>`).join('') || '<div style="padding:12px;color:var(--text3);font-size:12px">Aucune donnée</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+  await restoreExpandedAlertDetails();
+}
+
+// ── ALERTES ──────────────────────────────────────────────
+async function renderAlerts(el) {
+  const url = currentFilter === 'all'
+    ? `${API}/api/alerts?limit=200`
+    : `${API}/api/alerts?severity=${currentFilter}&limit=200`;
+  const alerts = await authFetch(url).then(r=>r.json());
+
+  el.innerHTML = `
+    <div class="alerts-panel">
+      <div class="alert-filters">
+        <span style="font-size:11px;color:var(--text3);font-family:var(--font-mono)">Filtre :</span>
+        ${['all','critical','high','medium','low'].map(f => `
+          <button class="filter-btn f-${f} ${currentFilter===f?'active':''}"
+            onclick="currentFilter='${f}';renderAlerts(document.getElementById('content'))">
+            ${f==='all'?'Tout':f}
+          </button>`).join('')}
+        <span style="margin-left:auto;font-size:11px;color:var(--text3);font-family:var(--font-mono)">${alerts.length} résultat(s)</span>
+      </div>
+      ${renderAlertsTable(alerts)}
+    </div>
+  `;
+  await restoreExpandedAlertDetails();
+}
+
+// ── Clé API agent (page Agents) ──────────────────────────
+async function loadAgentKey() {
+  try {
+    const res = await authFetch(`${API}/api/organization/agent-key`);
+    const data = await res.json();
+    const el = document.getElementById('agent-key-display');
+    if (el) el.textContent = data.agent_api_key;
+  } catch {}
+}
+function copyAgentKey() {
+  const el = document.getElementById('agent-key-display');
+  if (el) { navigator.clipboard.writeText(el.textContent); toast('Clé copiée'); }
+}
+async function regenerateAgentKey() {
+  if (!confirm("Régénérer la clé va invalider l'ancienne : tous les agents déjà installés devront être reconfigurés. Continuer ?")) return;
+  try {
+    const res = await authFetch(`${API}/api/organization/agent-key/regenerate`, { method: 'POST' });
+    const data = await res.json();
+    document.getElementById('agent-key-display').textContent = data.agent_api_key;
+    toast('Nouvelle clé générée');
+  } catch { toast('Erreur', false); }
+}
+
+// ── AGENTS ───────────────────────────────────────────────
+async function renderAgents(el) {
+  const agents = await authFetch(`${API}/api/agents`).then(r=>r.json());
+
+  el.innerHTML = `
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-head">Clé API agent — à configurer dans edr_agent.py</div>
+      <div style="padding:14px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <code id="agent-key-display" style="font-family:var(--font-mono);font-size:12px;color:var(--text2);background:var(--bg2);padding:6px 10px;border-radius:6px;border:1px solid var(--border)">Chargement…</code>
+        <button class="ack-btn" onclick="copyAgentKey()">Copier</button>
+        <button class="ack-btn" onclick="regenerateAgentKey()" style="color:var(--red)">Régénérer</button>
+      </div>
+    </div>
+    <div class="kpi-grid" style="margin-bottom:24px">
+      <div class="kpi grn"><div class="kpi-label">En ligne</div>   <div class="kpi-val">${agents.filter(a=>a.status==='active').length}</div></div>
+      <div class="kpi red"><div class="kpi-label">Hors ligne</div> <div class="kpi-val">${agents.filter(a=>a.status!=='active').length}</div></div>
+      <div class="kpi blu"><div class="kpi-label">Total</div>      <div class="kpi-val">${agents.length}</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">Tous les agents</div>
+      ${agents.map((a, i) => `
+        <div class="agent-row" style="align-items:flex-start;padding:14px 16px;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:flex-start;gap:10px;width:100%">
+            <div class="agent-status ${a.status}" style="margin-top:4px"></div>
+            <div style="flex:1">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+                <span class="agent-name">${a.agent_id}</span>
+                <span style="font-size:10px;color:var(--text3);font-family:var(--font-mono)">${a.os||'?'}</span>
+                ${a.local_ip ? `<span class="agent-pill">${a.local_ip}</span>` : ''}
+                ${a.logged_in_user ? `<span class="agent-pill" style="color:var(--purple)">${a.logged_in_user}</span>` : ''}
+                ${a.isolated ? `<span class="agent-pill" style="color:var(--red);border-color:var(--red)">Isolé</span>` : ''}
+              </div>
+              <div style="font-size:10px;color:var(--text3);margin-bottom:8px">
+                ${a.cpu_model || 'CPU inconnu'} · ${a.ram_total_gb ? a.ram_total_gb+' Go RAM' : 'RAM inconnue'}
+                ${a.public_ip ? ` · IP publique ${a.public_ip}` : ''}
+                ${(a.geo_city || a.geo_country) ? ` · ${[a.geo_city, a.geo_country].filter(Boolean).join(', ')}` : ''}
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+                ${[['CPU','cpu_percent','var(--blue)'],['RAM','ram_percent','var(--purple)'],['Disque','disk_percent','var(--orange)']].map(([lbl,k,col]) => `
+                  <div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                      <span style="font-size:10px;color:var(--text3)">${lbl}</span>
+                      <span style="font-size:10px;color:var(--text2);font-family:var(--font-mono)">${Math.round(a[k]||0)}%</span>
+                    </div>
+                    <div class="mini-bar-wrap">
+                      <div class="mini-bar" style="width:${clamp(a[k]||0,0,100)}%;background:${col}"></div>
+                    </div>
+                  </div>`).join('')}
+              </div>
+              <div style="margin-top:6px;font-size:10px;color:var(--text3);font-family:var(--font-mono);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span>Vu le ${ts(a.last_seen)} · ${a.process_count||0} processus</span>
+                ${(a.processes && a.processes.length) ? `<span class="login-back" style="margin:0" onclick="toggleProcesses(${i})">Voir les processus ▾</span>` : ''}
+                ${a.isolated
+                  ? `<button class="ack-btn" onclick="unisolateAgent('${a.agent_id}')" style="color:var(--green)">Lever l'isolement</button>`
+                  : `<button class="ack-btn" onclick="isolateAgent('${a.agent_id}')" style="color:var(--red)">Isoler du réseau</button>`}
+              </div>
+            </div>
+          </div>
+          <div id="proc-panel-${i}" style="display:none;width:100%;background:var(--bg2);border-radius:8px;padding:10px;margin-left:18px;max-height:260px;overflow-y:auto">
+            <table style="width:100%;font-size:11px;border-collapse:collapse">
+              <thead>
+                <tr style="color:var(--text3);text-align:left">
+                  <th style="padding:4px 8px;font-weight:500">PID</th>
+                  <th style="padding:4px 8px;font-weight:500">Processus</th>
+                  <th style="padding:4px 8px;font-weight:500">Utilisateur</th>
+                  <th style="padding:4px 8px;font-weight:500;text-align:right">CPU</th>
+                  <th style="padding:4px 8px;font-weight:500;text-align:right">RAM</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(a.processes||[]).map(p => `
+                  <tr style="border-top:1px solid var(--border)">
+                    <td style="padding:4px 8px;font-family:var(--font-mono);color:var(--text3)">${p.pid}</td>
+                    <td style="padding:4px 8px;font-family:var(--font-mono)">${p.name}</td>
+                    <td style="padding:4px 8px;color:var(--text2)">${p.user||'—'}</td>
+                    <td style="padding:4px 8px;text-align:right;font-family:var(--font-mono)">${p.cpu_percent}%</td>
+                    <td style="padding:4px 8px;text-align:right;font-family:var(--font-mono)">${p.memory_percent}%</td>
+                    <td style="padding:4px 8px;text-align:right">
+                      <button class="ack-btn" style="color:var(--red)" onclick="killProcess('${a.agent_id}',${p.pid},'${p.name}')">Tuer</button>
+                      <button class="ack-btn" style="color:var(--purple);margin-left:4px" onclick="quarantineProcess('${a.agent_id}',${p.pid},'${p.name}')">Quarantaine</button>
+                    </td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>`).join('') || '<div class="empty">Aucun agent enregistré</div>'}
+    </div>
+  `;
+  loadAgentKey();
+}
+
+async function isolateAgent(agentId) {
+  if (!confirm(`Isoler ${agentId} du réseau ? Toute communication sera bloquée sauf vers ce serveur. La commande sera exécutée au prochain heartbeat de l'agent (~15s).`)) return;
+  try {
+    await authFetch(`${API}/api/agents/${agentId}/isolate`, { method: 'POST' });
+    toast('Commande d\'isolation envoyée');
+    setTimeout(loadPage, 1000);
+  } catch { toast('Erreur', false); }
+}
+
+async function unisolateAgent(agentId) {
+  try {
+    await authFetch(`${API}/api/agents/${agentId}/unisolate`, { method: 'POST' });
+    toast('Commande de levée d\'isolement envoyée');
+    setTimeout(loadPage, 1000);
+  } catch { toast('Erreur', false); }
+}
+
+let _expandedAlertIds = new Set();
+
+async function toggleAlertDetails(alertId) {
+  if (_expandedAlertIds.has(alertId)) {
+    _expandedAlertIds.delete(alertId);
+  } else {
+    _expandedAlertIds.add(alertId);
+  }
+  applyAlertDetailState(alertId);
+  if (_expandedAlertIds.has(alertId)) await populateAlertDetailContent(alertId);
+}
+
+function applyAlertDetailState(alertId) {
+  const row = document.getElementById(`detail-row-${alertId}`);
+  const chev = document.getElementById(`chev-${alertId}`);
+  if (!row || !chev) return;
+  const expanded = _expandedAlertIds.has(alertId);
+  row.style.display = expanded ? 'table-row' : 'none';
+  chev.textContent = expanded ? 'v' : '>';
+}
+
+// Ré-applique l'état ouvert/fermé de chaque ligne après un re-rendu du
+// tableau (ex: rafraîchissement automatique toutes les 5s) — sans ça, le
+// panneau se refermait tout seul à chaque cycle.
+async function restoreExpandedAlertDetails() {
+  for (const alertId of _expandedAlertIds) {
+    applyAlertDetailState(alertId);
+    await populateAlertDetailContent(alertId);
+  }
+}
+
+async function populateAlertDetailContent(alertId) {
+  const content = document.getElementById(`detail-content-${alertId}`);
+  if (!content) return;
+  content.innerHTML = '<div style="color:var(--text3)">Chargement…</div>';
+
+  const alert = _alertsIndex[alertId];
+  const agent = alert ? await getAgentInfo(alert.agent_id) : null;
+
+  const rows = [
+    ['Composant', 'NHGuard'],
+    ['Nom de la machine', alert?.agent_id || '—'],
+    ["Type d'évènement", (alert?.category || '—').replace(/_/g, ' ')],
+    ['Sévérité', alert?.severity || '—'],
+    ['Score', alert?.score ?? '—'],
+    ['Heure de l\'évènement', ts(alert?.timestamp)],
+    ['Description complète', alert?.description || '—'],
+  ];
+  if (agent) {
+    rows.push(
+      ['Utilisateur connecté', agent.logged_in_user || '—'],
+      ['Adresse IP locale', agent.local_ip || '—'],
+      ['Adresse IP publique', agent.public_ip || '—'],
+      ['Localisation approximative', [agent.geo_city, agent.geo_region, agent.geo_country].filter(Boolean).join(', ') || '—'],
+      ['Système', agent.os || '—'],
+      ['Modèle CPU', agent.cpu_model || '—'],
+    );
+  }
+
+  content.innerHTML = `
+    <table style="width:100%;border-collapse:collapse">
+      ${rows.map(([label, value]) => `
+        <tr>
+          <td style="padding:3px 16px 3px 0;color:var(--text3);white-space:nowrap;vertical-align:top;width:180px">${label}</td>
+          <td style="padding:3px 0;color:var(--text2);font-family:var(--font-mono);word-break:break-word">${value}</td>
+        </tr>`).join('')}
+    </table>
+    ${!agent ? '<div style="color:var(--text3);margin-top:8px">Détails machine indisponibles (agent hors ligne ou données de démo incomplètes).</div>' : ''}
+  `;
+}
+
+async function killProcess(agentId, pid, name) {
+  if (!confirm(`Tuer le processus ${name} (PID ${pid}) sur ${agentId} ?`)) return;
+  try {
+    await authFetch(`${API}/api/agents/${agentId}/kill-process`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pid, name }),
+    });
+    toast('Commande envoyée, exécution au prochain heartbeat');
+  } catch { toast('Erreur', false); }
+}
+
+async function quarantineProcess(agentId, pid, name) {
+  if (!confirm(`Mettre en quarantaine ${name} (PID ${pid}) sur ${agentId} ? Le processus sera arrêté et son fichier déplacé.`)) return;
+  try {
+    await authFetch(`${API}/api/agents/${agentId}/quarantine-file`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pid, severity: 'high', reason: `Mise en quarantaine manuelle : ${name}` }),
+    });
+    toast('Commande envoyée, exécution au prochain heartbeat');
+  } catch { toast('Erreur', false); }
+}
+
+function toggleProcesses(i) {
+  const panel = document.getElementById(`proc-panel-${i}`);
+  const isHidden = panel.style.display === 'none';
+  panel.style.display = isHidden ? 'block' : 'none';
+}
+
+// ── QUARANTAINE ──────────────────────────────────────────
+let quarantineFilter = 'active';
+
+async function renderQuarantine(el) {
+  const [items, agents] = await Promise.all([
+    authFetch(`${API}/api/quarantine`).then(r=>r.json()),
+    authFetch(`${API}/api/agents`).then(r=>r.json()),
+  ]);
+  const active = items.filter(i => !i.restored);
+  const inactive = items.filter(i => i.restored);
+
+  const shown = quarantineFilter === 'active' ? active : inactive;
+
+  el.innerHTML = `
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-head">Mettre un fichier en quarantaine manuellement</div>
+      <div style="padding:14px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div>
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Agent</label>
+          <select id="mq-agent" style="background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+            ${agents.map(a => `<option value="${a.agent_id}">${a.agent_id}</option>`).join('') || '<option value="">Aucun agent</option>'}
+          </select>
+        </div>
+        <div style="flex:2;min-width:200px">
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Chemin du fichier sur la machine</label>
+          <input id="mq-path" placeholder="C:\\Users\\...\\fichier.exe" style="width:100%;background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Sévérité</label>
+          <select id="mq-severity" style="background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+            <option value="critical">Critique</option>
+            <option value="high" selected>Haute</option>
+            <option value="medium">Moyenne</option>
+            <option value="low">Basse</option>
+          </select>
+        </div>
+        <div style="flex:2;min-width:180px">
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Raison</label>
+          <input id="mq-reason" placeholder="ex: fichier suspect trouvé lors d'une vérification" style="width:100%;background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+        </div>
+        <button class="ack-btn" onclick="manualQuarantine()" style="color:var(--red);height:29px">Mettre en quarantaine</button>
+      </div>
+      <div style="padding:0 16px 12px;font-size:10px;color:var(--text3)">Exécuté au prochain heartbeat de l'agent (~15s). Le processus correspondant, s'il tourne, sera aussi arrêté.</div>
+    </div>
+
+    <div class="kpi-grid" style="margin-bottom:24px">
+      <div class="kpi red"><div class="kpi-label">Menaces actives</div> <div class="kpi-val">${active.length}</div></div>
+      <div class="kpi grn"><div class="kpi-label">Non actives (résolues)</div> <div class="kpi-val">${inactive.length}</div></div>
+      <div class="kpi blu"><div class="kpi-label">Total historique</div> <div class="kpi-val">${items.length}</div></div>
+    </div>
+
+    <div class="alerts-panel">
+      <div class="alert-filters">
+        <button class="filter-btn ${quarantineFilter==='active'?'active':''}" onclick="quarantineFilter='active';loadPage()">Menaces actives (${active.length})</button>
+        <button class="filter-btn ${quarantineFilter==='inactive'?'active':''}" onclick="quarantineFilter='inactive';loadPage()">Non actives (${inactive.length})</button>
+      </div>
+      ${!shown.length ? `<div class="empty">${quarantineFilter==='active' ? 'Aucune menace active' : 'Aucun élément résolu pour l\'instant'}</div>` : `
+      <table class="alerts-table">
+        <thead>
+          <tr>
+            <th>Sévérité</th>
+            <th>Fichier</th>
+            <th>Raison</th>
+            <th>Agent</th>
+            <th>Action</th>
+            <th>Heure</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${shown.map(i => `
+            <tr style="${i.restored?'opacity:.4':''}">
+              <td><span class="sev sev-${i.severity}">${i.severity}</span></td>
+              <td style="max-width:260px">
+                <div style="font-size:12px;color:var(--text1);font-weight:500">${i.file_name}</div>
+                <div style="font-size:10px;color:var(--text3);margin-top:2px;word-break:break-all;font-family:var(--font-mono)">${i.file_path}</div>
+              </td>
+              <td><span class="cat">${i.reason||'—'}</span></td>
+              <td><span class="agent-pill">${i.agent_id}</span></td>
+              <td>
+                ${i.action==='process_terminated'
+                  ? '<span style="font-size:10px;color:var(--green)">Processus stoppé</span>'
+                  : i.action==='manual_quarantine'
+                  ? '<span style="font-size:10px;color:var(--purple)">Quarantaine manuelle</span>'
+                  : '<span style="font-size:10px;color:var(--orange)">Détecté seulement</span>'}
+                ${i.file_moved ? '<br><span style="font-size:10px;color:var(--blue)">Fichier déplacé</span>' : ''}
+              </td>
+              <td><span class="ts">${ts(i.timestamp)}</span></td>
+              <td style="white-space:nowrap">${i.restored
+                  ? '<span style="font-size:10px;color:var(--text3)">Restauré</span>'
+                  : `${i.file_moved ? `<button class="ack-btn" onclick="restoreFile('${i.id}')" style="color:var(--blue)">Restaurer le fichier</button>` : ''}
+                     <button class="ack-btn" onclick="restoreQuarantine('${i.id}')" style="margin-left:4px">Faux positif</button>`}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`}
+    </div>
+  `;
+}
+
+async function manualQuarantine() {
+  const agentId = document.getElementById('mq-agent').value;
+  const path = document.getElementById('mq-path').value.trim();
+  const severity = document.getElementById('mq-severity').value;
+  const reason = document.getElementById('mq-reason').value.trim() || 'Mise en quarantaine manuelle depuis le dashboard';
+  if (!agentId) { toast('Aucun agent disponible', false); return; }
+  if (!path) { toast('Renseigne le chemin du fichier', false); return; }
+  try {
+    const res = await authFetch(`${API}/api/agents/${agentId}/quarantine-file`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, severity, reason }),
+    });
+    if (res.ok) { toast('Commande de quarantaine envoyée'); document.getElementById('mq-path').value=''; }
+    else { const d = await res.json(); toast(d.error || 'Erreur', false); }
+  } catch { toast('Erreur', false); }
+}
+
+async function quarantineFromAlert(agentId, severity, title) {
+  const path = prompt(`Chemin du fichier à mettre en quarantaine sur ${agentId} :`, '');
+  if (!path) return;
+  try {
+    const res = await authFetch(`${API}/api/agents/${agentId}/quarantine-file`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: path.trim(), severity, reason: `Depuis l'alerte : ${title}` }),
+    });
+    if (res.ok) { toast('Commande de quarantaine envoyée'); }
+    else { const d = await res.json(); toast(d.error || 'Erreur', false); }
+  } catch { toast('Erreur', false); }
+}
+
+async function restoreFile(id) {
+  if (!confirm("Remettre réellement ce fichier à son emplacement d'origine sur la machine ? La commande sera exécutée au prochain heartbeat de l'agent.")) return;
+  try {
+    await authFetch(`${API}/api/quarantine/${id}/restore-file`, { method: 'POST' });
+    toast('Commande de restauration envoyée');
+    loadPage();
+  } catch { toast('Erreur', false); }
+}
+
+async function restoreQuarantine(id) {
+  try {
+    await authFetch(`${API}/api/quarantine/${id}/restore`, { method: 'POST' });
+    toast('Marqué comme faux positif');
+    loadPage();
+  } catch { toast('Erreur', false); }
+}
+
+// ── Table alertes (réutilisable) ─────────────────────────
+let _alertsIndex = {};
+let _agentsIndex = null;
+
+async function getAgentInfo(agentId) {
+  if (!_agentsIndex) {
+    try {
+      const list = await authFetch(`${API}/api/agents`).then(r => r.json());
+      _agentsIndex = {};
+      list.forEach(a => { _agentsIndex[a.agent_id] = a; });
+    } catch { _agentsIndex = {}; }
+  }
+  return _agentsIndex[agentId] || null;
+}
+
+function renderAlertsTable(alerts) {
+  if (!alerts.length) return '<div class="empty">Aucune alerte — système sain</div>';
+  alerts.forEach(a => { _alertsIndex[a.id] = a; });
+  return `
+    <table class="alerts-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th>Score</th>
+          <th>Sévérité</th>
+          <th>Titre</th>
+          <th>Agent</th>
+          <th>Catégorie</th>
+          <th>Heure</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${alerts.map(a => `
+          <tr data-id="${a.id}" style="${a.acknowledged?'opacity:.4':''}">
+            <td style="cursor:pointer;width:20px" onclick="toggleAlertDetails('${a.id}')"><span id="chev-${a.id}" style="color:var(--text3);font-family:var(--font-mono)">&gt;</span></td>
+            <td><span class="score-badge score-${a.severity}">${a.score ?? '—'}</span></td>
+            <td><span class="sev sev-${a.severity}">${a.severity}</span></td>
+            <td style="max-width:260px">
+              <div style="font-size:12px;color:var(--text1);font-weight:500">${a.title||'—'}</div>
+              <div style="font-size:11px;color:var(--text3);margin-top:2px">${(a.description||'').substring(0,80)}${(a.description||'').length>80?'…':''}</div>
+            </td>
+            <td><span class="agent-pill">${a.agent_id}</span></td>
+            <td><span class="cat">${(a.category||'—').replace(/_/g,' ')}</span></td>
+            <td><span class="ts">${ts(a.timestamp)}</span></td>
+            <td style="white-space:nowrap">
+              <button class="ack-btn" onclick="showProcessTimeline('${a.id}','${(a.title||'').replace(/'/g,"\\'")}')" title="Voir la chaîne d'exécution">Timeline</button>
+              <button class="ack-btn" onclick="quarantineFromAlert('${a.agent_id}','${a.severity}','${(a.title||'').replace(/'/g,"\\'")}')" style="margin-left:6px;color:var(--purple)">Mettre en quarantaine</button>
+              ${a.acknowledged?'<span style="font-size:10px;color:var(--green);margin-left:6px">OK</span>':`<button class="ack-btn" onclick="ack('${a.id}')" style="margin-left:6px">Acquitter</button>`}
+            </td>
+          </tr>
+          <tr id="detail-row-${a.id}" style="display:none">
+            <td colspan="8" style="background:var(--bg2);padding:0;border-bottom:1px solid var(--border)">
+              <div id="detail-content-${a.id}" style="padding:14px 20px;font-size:11px"></div>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+// ── Process Timeline (arbre d'exécution, modale) ─────────
+async function showProcessTimeline(alertId, alertTitle) {
+  const modal = document.createElement('div');
+  modal.id = 'timeline-modal';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:20px';
+  modal.innerHTML = `
+    <div style="background:var(--bg1);border:1px solid var(--border);border-radius:12px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:20px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <div style="font-size:14px;font-weight:600">Process Timeline</div>
+        <button onclick="document.getElementById('timeline-modal').remove()" style="background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer">X</button>
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:16px">${alertTitle}</div>
+      <div id="timeline-content"><div class="empty" style="padding:24px">Chargement…</div></div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  try {
+    const events = await authFetch(`${API}/api/alerts/${alertId}/process-tree`).then(r=>r.json());
+    const icons = { process: '', file: '', network: '', registry: '' };
+    const content = document.getElementById('timeline-content');
+    if (!events.length) {
+      content.innerHTML = '<div class="empty" style="padding:24px">Aucun évènement de processus enregistré pour cette alerte</div>';
+      return;
+    }
+    content.innerHTML = events.map((e, i) => `
+      <div style="display:flex;gap:10px;padding:8px 0;${i>0?'border-top:1px solid var(--border)':''}">
+        <div style="font-size:16px;flex-shrink:0">${icons[e.event_type]||'•'}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;color:var(--text1);font-family:var(--font-mono)">
+            ${e.parent_name ? `<span style="color:var(--text3)">${e.parent_name}</span> → ` : ''}<strong>${e.process_name||'?'}</strong>
+            ${e.pid ? `<span style="color:var(--text3)">(PID ${e.pid})</span>` : ''}
+          </div>
+          ${e.detail ? `<div style="font-size:11px;color:var(--text2);margin-top:2px;word-break:break-all">${e.detail}</div>` : ''}
+          <div style="font-size:10px;color:var(--text3);margin-top:2px;font-family:var(--font-mono)">${e.event_type} · ${ts(e.timestamp)}</div>
+        </div>
+      </div>`).join('');
+  } catch {
+    document.getElementById('timeline-content').innerHTML = '<div class="empty">Erreur de chargement</div>';
+  }
+}
+
+// ── INVESTIGATE (agrégations façon query builder) ────────
+async function renderInvestigate(el) {
+  const [agg, iocs] = await Promise.all([
+    authFetch(`${API}/api/investigate/aggregations`).then(r=>r.json()),
+    authFetch(`${API}/api/iocs`).then(r=>r.json()),
+  ]);
+  const sections = [
+    ['Sévérité', 'severite'], ['Catégorie', 'categorie'],
+    ['Agent', 'agent'], ['Système', 'os'], ['Utilisateur connecté', 'utilisateur'],
+  ];
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:16px">
+      ${sections.map(([label, key]) => `
+        <div class="panel">
+          <div class="panel-head">${label}</div>
+          <div style="padding:8px 16px 14px">
+            ${(agg[key]||[]).length ? agg[key].map(item => `
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,52,68,.4);font-size:12px">
+                <span style="color:var(--text2)">${(item.label||'').replace(/_/g,' ')}</span>
+                <span class="agent-pill">${item.count}</span>
+              </div>`).join('') : '<div style="color:var(--text3);font-size:12px;padding:8px 0">Aucune donnée</div>'}
+          </div>
+        </div>`).join('')}
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Indicateurs de compromission (IoC) — moteur de détection</div>
+      <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div>
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Type</label>
+          <select id="ioc-type" style="background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+            <option value="hash">Hash SHA-256</option>
+            <option value="ip">Adresse IP</option>
+            <option value="cmdline_pattern">Motif de ligne de commande (regex)</option>
+          </select>
+        </div>
+        <div style="flex:1;min-width:160px">
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Valeur</label>
+          <input id="ioc-value" placeholder="ex: 44d88612fea8a8f36de82e1278abb02f" style="width:100%;background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Sévérité</label>
+          <select id="ioc-severity" style="background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+            <option value="critical">Critique</option>
+            <option value="high" selected>Haute</option>
+            <option value="medium">Moyenne</option>
+            <option value="low">Basse</option>
+          </select>
+        </div>
+        <div style="flex:2;min-width:160px">
+          <label style="display:block;font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase">Description</label>
+          <input id="ioc-description" placeholder="ex: Hash connu du ransomware X" style="width:100%;background:var(--bg2);border:1px solid var(--border);color:var(--text1);border-radius:6px;padding:6px 8px;font-size:12px">
+        </div>
+        <button class="ack-btn" onclick="addIoc()" style="color:var(--teal);height:29px">+ Ajouter</button>
+      </div>
+      <div style="max-height:280px;overflow-y:auto">
+        ${!iocs.length ? '<div class="empty" style="padding:20px">Aucun IoC configuré</div>' : `
+        <table class="alerts-table">
+          <thead><tr><th>Type</th><th>Valeur</th><th>Sévérité</th><th>Description</th><th></th></tr></thead>
+          <tbody>
+            ${iocs.map(i => `
+              <tr>
+                <td><span class="cat">${i.type}</span></td>
+                <td style="font-family:var(--font-mono);font-size:11px;word-break:break-all;max-width:220px">${i.value}</td>
+                <td><span class="sev sev-${i.severity}">${i.severity}</span></td>
+                <td style="font-size:11px;color:var(--text2)">${i.description||'—'}</td>
+                <td><button class="ack-btn" onclick="deleteIoc('${i.id}')" style="color:var(--red)">Supprimer</button></td>
+              </tr>`).join('')}
+          </tbody>
+        </table>`}
+      </div>
+      <div style="padding:10px 16px;font-size:10px;color:var(--text3)">Les agents récupèrent cette liste toutes les ~60 secondes.</div>
+    </div>
+  `;
+}
+
+async function addIoc() {
+  const type = document.getElementById('ioc-type').value;
+  const value = document.getElementById('ioc-value').value.trim();
+  const severity = document.getElementById('ioc-severity').value;
+  const description = document.getElementById('ioc-description').value.trim();
+  if (!value) { toast('Renseigne une valeur', false); return; }
+  try {
+    const res = await authFetch(`${API}/api/iocs`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, value, severity, description }),
+    });
+    if (res.ok) { toast('IoC ajouté'); loadPage(); }
+    else { const d = await res.json(); toast(d.error || 'Erreur', false); }
+  } catch { toast('Erreur', false); }
+}
+
+async function deleteIoc(id) {
+  try {
+    await authFetch(`${API}/api/iocs/${id}`, { method: 'DELETE' });
+    toast('IoC supprimé');
+    loadPage();
+  } catch { toast('Erreur', false); }
+}
+
+// ── HISTORIQUE (audit de toutes les commandes/actions) ──
+async function renderHistory(el) {
+  const commands = await authFetch(`${API}/api/history?limit=200`).then(r=>r.json());
+  const icons = {
+    isolate: '', unisolate: '', kill_process: '',
+    quarantine_file: '', restore_file: '',
+  };
+  const labels = {
+    isolate: 'Isolation réseau', unisolate: "Levée d'isolement", kill_process: 'Arrêt de processus',
+    quarantine_file: 'Mise en quarantaine', restore_file: 'Restauration de fichier',
+  };
+  const statusBadge = {
+    pending: '<span style="font-size:10px;color:var(--yellow)">⏳ En attente</span>',
+    done:    '<span style="font-size:10px;color:var(--green)">Exécuté</span>',
+    failed:  '<span style="font-size:10px;color:var(--red)">Échoué</span>',
+  };
+
+  el.innerHTML = `
+    <div class="alerts-panel">
+      ${!commands.length ? '<div class="empty">Aucune action enregistrée pour l\'instant</div>' : `
+      <table class="alerts-table">
+        <thead>
+          <tr>
+            <th>Action</th>
+            <th>Agent</th>
+            <th>Détails</th>
+            <th>Statut</th>
+            <th>Résultat</th>
+            <th>Heure</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${commands.map(c => `
+            <tr>
+              <td>${icons[c.action]||'•'} ${labels[c.action]||c.action}</td>
+              <td><span class="agent-pill">${c.agent_id}</span></td>
+              <td style="font-size:11px;color:var(--text2);font-family:var(--font-mono);max-width:220px;word-break:break-all">
+                ${c.params && c.params.path ? c.params.path : ''}
+                ${c.params && c.params.pid ? `PID ${c.params.pid}` : ''}
+                ${c.params && c.params.name ? ` (${c.params.name})` : ''}
+              </td>
+              <td>${statusBadge[c.status]||c.status}</td>
+              <td style="font-size:11px;color:var(--text3);max-width:220px">${c.result||'—'}</td>
+              <td><span class="ts">${ts(c.executed_at || c.created_at)}</span></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`}
+    </div>
+  `;
+}
+
+// ── Démarrage ────────────────────────────────────────────
+checkExistingSession();
+</script>
+</body>
+</html>
