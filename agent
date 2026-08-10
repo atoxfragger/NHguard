@@ -4,35 +4,35 @@ edr_agent.py — Agent EDR à installer sur une machine à surveiller.
 ⚠️ NE JAMAIS installer ce programme sur une machine sans l'accord
 explicite de son propriétaire ou de l'administrateur du parc.
 
-Contrairement à la version précédente, ce fichier NE CONTIENT PLUS
-la clé API ni l'adresse du serveur en dur dans le code. Au premier
-lancement, une petite fenêtre demande ces informations et les
-enregistre dans un fichier de configuration LOCAL à la machine :
-
+La configuration (URL du serveur, clé API, nom de la machine) est
+demandée une seule fois au premier lancement et stockée localement :
     %APPDATA%\\EDRAgent\\config.json   (Windows)
     ~/.config/EDRAgent/config.json      (Linux/macOS)
-
-Pourquoi ce changement : si vous compilez ce script en .exe pour le
-distribuer à vos clients (voir instructions PyInstaller plus bas),
-un utilisateur qui décompile l'exe ne doit voir NI votre code source
-NI la clé d'un autre client. Chaque poste stocke uniquement SA
-propre clé, saisie une fois lors de l'installation.
+— jamais en dur dans le code, pour pouvoir distribuer un seul .exe à
+plusieurs clients sans qu'aucun ne voie la clé d'un autre.
 
 Ce que fait l'agent :
-  - Envoie un "heartbeat" toutes les X secondes (CPU, RAM, disque, OS,
-    modèle CPU, RAM totale, IP locale, utilisateur connecté, top processus)
-  - Surveille les processus en cours et, sur une liste basique de noms
-    connus comme malveillants, TERMINE le processus et enregistre le
-    fichier exécutable concerné dans la liste de quarantaine du dashboard
-    (liste à adapter — ce n'est PAS un antivirus complet)
+  - Heartbeat périodique (CPU, RAM, disque, OS, modèle CPU, RAM totale,
+    IP locale, utilisateur connecté, top processus)
+  - Moteur de détection à plusieurs niveaux :
+      1. Liste de noms de processus connus comme malveillants
+      2. IoC (indicateurs de compromission) définis dans le dashboard :
+         hash SHA-256, adresses IP, motifs de ligne de commande
+      3. Quelques motifs intégrés (PowerShell encodé, etc.)
+      4. Détection "LOLBins" : une application bureautique qui lance un
+         interpréteur de script (winword.exe -> powershell.exe, etc.)
+  - Sur détection : arrête le processus ET déplace RÉELLEMENT le fichier
+    exécutable vers un dossier de quarantaine local (restaurable depuis
+    le dashboard) — pas seulement un signalement
+  - Exécute les commandes à distance déposées depuis le dashboard :
+    isoler/lever l'isolement réseau, tuer un PID précis, restaurer un
+    fichier mis en quarantaine
 
 Ce que l'agent NE fait PAS :
-  - Il ne déplace, ne supprime, ni ne chiffre aucun fichier — seul le
-    PROCESSUS en cours d'exécution est arrêté ; le fichier reste en place
-    sur le disque (pour éviter tout dégât en cas de faux positif)
-  - Il ne lit ni ne transmet le contenu d'aucun fichier personnel
+  - Il ne lit ni ne transmet le contenu d'un fichier personnel non détecté
   - Il ne prend pas le contrôle du clavier/souris/écran
-  - Il n'ouvre aucun accès distant vers la machine
+  - Il n'exécute AUCUNE commande arbitraire — seulement les actions
+    prédéfinies ci-dessus, toutes tracées côté serveur
 
 Installation (pour lancer le .py directement) :
     pip install requests psutil
@@ -40,12 +40,20 @@ Installation (pour lancer le .py directement) :
 Pour le distribuer en .exe (voir aussi build_agent.bat fourni à côté) :
     pip install pyinstaller
     pyinstaller --onefile --name EDRAgent edr_agent.py
+
+Isolation réseau : nécessite des droits administrateur (modifie le
+pare-feu Windows). Sans ces droits, la commande échoue proprement et
+le résultat "failed" est rapporté au serveur.
 """
 
+import hashlib
 import json
 import os
 import platform
+import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 
@@ -54,13 +62,14 @@ import requests
 
 APP_NAME = "EDRAgent"
 REPORT_INTERVAL_SECONDS = 15
+IOC_REFRESH_EVERY_N_CYCLES = 4   # rafraîchit les IoC toutes les ~60s
+
+FIREWALL_RULE_PREFIX = "NHGuard-Isolation"
 
 
 def _redirect_output_if_no_console():
-    """Sous pythonw.exe (lancé sans fenêtre, ex: démarrage automatique via
-    Tâches planifiées) ou un .exe compilé en --windowed, sys.stdout/stderr
-    valent None : le moindre print() ferait planter le script. On redirige
-    alors la sortie vers un fichier log, pour garder une trace utile."""
+    """Sous pythonw.exe (lancé sans fenêtre) ou un .exe --windowed,
+    sys.stdout/stderr valent None : on redirige vers un fichier log."""
     if sys.stdout is None or sys.stderr is None:
         if platform.system() == "Windows":
             base = os.environ.get("APPDATA", os.path.expanduser("~"))
@@ -75,9 +84,8 @@ def _redirect_output_if_no_console():
 
 _redirect_output_if_no_console()
 
-# Liste très basique de noms de processus considérés comme sensibles, à
-# titre d'exemple pédagogique. À adapter (idéalement pilotée depuis le
-# serveur plutôt qu'en dur ici).
+# Liste basique de noms de processus considérés comme sensibles, à titre
+# d'exemple pédagogique — complétée par le moteur d'IoC ci-dessous.
 SUSPICIOUS_PROCESS_NAMES = {
     "mimikatz.exe": ("critical", "credential_access", "Outil de vol d'identifiants détecté"),
     "psexec.exe":   ("medium",   "lateral_movement",  "Outil d'exécution distante détecté"),
@@ -85,12 +93,30 @@ SUSPICIOUS_PROCESS_NAMES = {
     "nc.exe":       ("medium",   "network",            "Outil réseau potentiellement utilisé pour l'exfiltration"),
 }
 
+# Motifs de ligne de commande intégrés (classiques, indépendants des IoC
+# custom définis dans le dashboard).
+BUILTIN_CMDLINE_PATTERNS = [
+    (r"-enc(odedcommand)?\s+[A-Za-z0-9+/=]{20,}", "high", "malware",
+     "Commande PowerShell encodée en base64"),
+    (r"iex\s*\(", "high", "malware", "Invoke-Expression (exécution dynamique de code)"),
+    (r"-executionpolicy\s+bypass", "medium", "defense_evasion", "Contournement de la politique d'exécution PowerShell"),
+    (r"downloadstring|downloadfile", "high", "malware", "Téléchargement de payload via PowerShell"),
+    (r"certutil.*-urlcache", "high", "malware", "certutil détourné pour télécharger un fichier"),
+]
+
+# Applications bureautiques qui ne devraient normalement jamais lancer un
+# interpréteur de script — signature classique de macro malveillante.
+OFFICE_APPS = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "mspub.exe"}
+SCRIPT_INTERPRETERS = {"powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe", "mshta.exe"}
+
 _already_alerted = set()
+_hash_cache = {}   # chemin de fichier -> hash SHA-256 (évite de re-hasher à chaque cycle)
+_iocs_cache = {"hash": {}, "ip": {}, "cmdline_pattern": []}
+_cycle_count = 0
 
 
 # ──────────────────────────────────────────────────────────
-# Configuration locale (créée au premier lancement, jamais
-# embarquée dans le code / l'exécutable)
+# Configuration locale
 # ──────────────────────────────────────────────────────────
 def config_path():
     if platform.system() == "Windows":
@@ -100,6 +126,16 @@ def config_path():
     folder = os.path.join(base, APP_NAME)
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "config.json")
+
+
+def quarantine_dir():
+    if platform.system() == "Windows":
+        base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    else:
+        base = "/var/tmp"
+    folder = os.path.join(base, APP_NAME, "Quarantine")
+    os.makedirs(folder, exist_ok=True)
+    return folder
 
 
 def load_config():
@@ -116,10 +152,8 @@ def save_config(server_url, api_key, agent_id):
 
 
 def first_run_setup():
-    """Petite fenêtre demandant l'URL du serveur, la clé API et le nom
-    d'affichage à saisir une seule fois. C'est la seule information que
-    ce poste connaîtra — jamais stockée dans le code partagé avec
-    d'autres clients."""
+    """Fenêtre demandant l'URL du serveur, la clé API et le nom d'affichage,
+    une seule fois — jamais stocké dans le code partagé entre clients."""
     import tkinter as tk
     from tkinter import messagebox
 
@@ -166,7 +200,7 @@ def first_run_setup():
     root.mainloop()
 
     if "api_key" not in result:
-        sys.exit(0)  # fenêtre fermée sans valider
+        sys.exit(0)
 
     save_config(result["server_url"], result["api_key"], result["agent_id"])
     return {"server_url": result["server_url"], "api_key": result["api_key"], "agent_id": result["agent_id"]}
@@ -180,12 +214,9 @@ def get_config():
 
 
 # ──────────────────────────────────────────────────────────
-# Collecte & envoi
+# Collecte système
 # ──────────────────────────────────────────────────────────
 def get_local_ip():
-    """Astuce classique : ouvre une connexion UDP factice pour connaître l'IP
-    locale réellement utilisée pour sortir sur le réseau (aucun paquet n'est
-    vraiment envoyé, 8.8.8.8 sert juste de cible de routage)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -194,6 +225,36 @@ def get_local_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+_geo_cache = {"public_ip": None, "city": None, "region": None, "country": None}
+_geo_last_fetch = 0
+GEO_REFRESH_SECONDS = 3600  # la localisation ne change pas souvent, on évite de la re-demander à chaque heartbeat
+
+
+def get_geolocation():
+    """Récupère IP publique + localisation approximative (ville/pays) via un
+    service gratuit, mis en cache 1h. Purement informatif pour le dashboard
+    (savoir depuis où une machine se connecte) — aucune donnée précise
+    (rue, coordonnées GPS exactes) n'est demandée ni transmise."""
+    global _geo_last_fetch
+    now = time.time()
+    if _geo_cache["public_ip"] and (now - _geo_last_fetch) < GEO_REFRESH_SECONDS:
+        return dict(_geo_cache)
+    try:
+        r = requests.get("https://ipapi.co/json/", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            _geo_cache.update({
+                "public_ip": data.get("ip"),
+                "city": data.get("city"),
+                "region": data.get("region"),
+                "country": data.get("country_name"),
+            })
+            _geo_last_fetch = now
+    except requests.RequestException:
+        pass  # pas grave si indisponible, le heartbeat continue sans géolocalisation
+    return dict(_geo_cache)
 
 
 def get_logged_in_user():
@@ -205,8 +266,6 @@ def get_logged_in_user():
 
 
 def get_top_processes(limit=25):
-    """Snapshot des processus les plus consommateurs (CPU puis RAM),
-    envoyé au serveur à chaque heartbeat pour affichage dans le dashboard."""
     procs = []
     for p in psutil.process_iter(["pid", "name", "username", "cpu_percent", "memory_percent"]):
         try:
@@ -225,6 +284,7 @@ def get_top_processes(limit=25):
 
 
 def collect_system_stats(agent_id):
+    geo = get_geolocation()
     return {
         "agent_id": agent_id,
         "cpu_percent": psutil.cpu_percent(interval=1),
@@ -236,11 +296,19 @@ def collect_system_stats(agent_id):
         "cpu_model": platform.processor() or "Inconnu",
         "ram_total_gb": round(psutil.virtual_memory().total / (1024 ** 3), 1),
         "local_ip": get_local_ip(),
+        "public_ip": geo.get("public_ip"),
+        "geo_city": geo.get("city"),
+        "geo_region": geo.get("region"),
+        "geo_country": geo.get("country"),
         "logged_in_user": get_logged_in_user(),
         "processes": get_top_processes(),
     }
 
 
+
+# ──────────────────────────────────────────────────────────
+# Communication serveur
+# ──────────────────────────────────────────────────────────
 def send_heartbeat(cfg, stats):
     headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
     try:
@@ -263,70 +331,466 @@ def send_alert(cfg, title, description, severity, category):
         r = requests.post(f"{cfg['server_url']}/api/agents/alert", json=payload, headers=headers, timeout=5)
         if r.status_code == 201:
             print(f"[ALERTE ENVOYÉE] {title}")
-        else:
-            print(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
+            return r.json().get("id")
+        print(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
         print(f"[!] Serveur injoignable : {e}")
+    return None
 
 
-def send_quarantine(cfg, file_path, reason, action, severity):
+def send_quarantine(cfg, file_path, reason, action, severity, quarantine_path=None, file_moved=False):
     headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
     payload = {
         "file_path": file_path, "reason": reason, "action": action,
         "severity": severity, "agent_id": cfg["agent_id"],
+        "quarantine_path": quarantine_path, "file_moved": file_moved,
     }
     try:
         r = requests.post(f"{cfg['server_url']}/api/agents/quarantine", json=payload, headers=headers, timeout=5)
         if r.status_code == 201:
-            print(f"[QUARANTAINE] {file_path} ({action})")
+            print(f"[QUARANTAINE] {file_path} ({action}, déplacé={file_moved})")
         else:
             print(f"[!] Erreur envoi quarantaine ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
         print(f"[!] Serveur injoignable : {e}")
 
 
-def scan_processes(cfg):
-    for proc in psutil.process_iter(["pid", "name"]):
-        name = (proc.info.get("name") or "").lower()
-        if name in SUSPICIOUS_PROCESS_NAMES and name not in _already_alerted:
-            severity, category, description = SUSPICIOUS_PROCESS_NAMES[name]
+def send_process_events(cfg, alert_id, events):
+    if not alert_id or not events:
+        return
+    headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
+    payload = {"alert_id": alert_id, "agent_id": cfg["agent_id"], "events": events}
+    try:
+        r = requests.post(f"{cfg['server_url']}/api/agents/process-events", json=payload, headers=headers, timeout=5)
+        if r.status_code != 201:
+            print(f"[!] Erreur envoi arbre de processus ({r.status_code}) : {r.text}")
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable : {e}")
 
-            # Récupère le chemin du fichier exécutable avant de tenter quoi que ce soit
+
+def fetch_iocs(cfg):
+    """Récupère la liste des IoC de l'organisation et les indexe par type
+    pour une recherche rapide à chaque cycle de scan."""
+    headers = {"X-Agent-Key": cfg["api_key"]}
+    try:
+        r = requests.get(f"{cfg['server_url']}/api/agents/iocs", headers=headers, timeout=5)
+        if r.status_code != 200:
+            return
+        iocs = r.json()
+        hashes, ips, patterns = {}, {}, []
+        for ioc in iocs:
+            if ioc["type"] == "hash":
+                hashes[ioc["value"].lower()] = ioc
+            elif ioc["type"] == "ip":
+                ips[ioc["value"]] = ioc
+            elif ioc["type"] == "cmdline_pattern":
+                try:
+                    patterns.append((re.compile(ioc["value"], re.IGNORECASE), ioc))
+                except re.error:
+                    pass  # motif invalide fourni par l'admin -> ignoré silencieusement
+        _iocs_cache["hash"] = hashes
+        _iocs_cache["ip"] = ips
+        _iocs_cache["cmdline_pattern"] = patterns
+        print(f"[IoC] {len(hashes)} hash, {len(ips)} IP, {len(patterns)} motifs chargés")
+    except requests.RequestException as e:
+        print(f"[!] Impossible de récupérer les IoC : {e}")
+
+
+# ──────────────────────────────────────────────────────────
+# Isolation réseau (nécessite les droits administrateur)
+# ──────────────────────────────────────────────────────────
+def isolate_network(cfg):
+    """Bloque tout le trafic sortant/entrant SAUF vers le serveur EDR,
+    via des règles de pare-feu Windows nommées (facilement identifiables
+    et supprimables). Retourne (succès, message)."""
+    if platform.system() != "Windows":
+        return False, "Isolation réseau seulement implémentée pour Windows"
+    try:
+        server_host = cfg["server_url"].split("//")[-1].split(":")[0].split("/")[0]
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={FIREWALL_RULE_PREFIX}-allow-server", "dir=out", "action=allow",
+            f"remoteip={server_host}",
+        ], check=True, capture_output=True, timeout=10)
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={FIREWALL_RULE_PREFIX}-block-out", "dir=out", "action=block",
+        ], check=True, capture_output=True, timeout=10)
+        subprocess.run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={FIREWALL_RULE_PREFIX}-block-in", "dir=in", "action=block",
+        ], check=True, capture_output=True, timeout=10)
+        return True, "Machine isolée : tout le trafic est bloqué sauf vers le serveur EDR"
+    except subprocess.CalledProcessError as e:
+        return False, f"Échec (droits administrateur requis ?) : {e}"
+    except Exception as e:
+        return False, f"Erreur inattendue : {e}"
+
+
+def unisolate_network(cfg):
+    if platform.system() != "Windows":
+        return False, "Isolation réseau seulement implémentée pour Windows"
+    try:
+        for suffix in ("allow-server", "block-out", "block-in"):
+            subprocess.run([
+                "netsh", "advfirewall", "firewall", "delete", "rule",
+                f"name={FIREWALL_RULE_PREFIX}-{suffix}",
+            ], capture_output=True, timeout=10)
+        return True, "Isolement levé, trafic réseau normal restauré"
+    except Exception as e:
+        return False, f"Erreur inattendue : {e}"
+
+
+# ──────────────────────────────────────────────────────────
+# Commandes à distance (isolation, kill process, restauration fichier)
+# ──────────────────────────────────────────────────────────
+def send_command_result(cfg, command_id, status, result=""):
+    headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
+    try:
+        requests.post(f"{cfg['server_url']}/api/agents/commands/{command_id}/result",
+                       json={"status": status, "result": result}, headers=headers, timeout=5)
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable pour rapporter le résultat : {e}")
+
+
+def poll_and_execute_commands(cfg):
+    headers = {"X-Agent-Key": cfg["api_key"]}
+    try:
+        r = requests.get(f"{cfg['server_url']}/api/agents/commands",
+                          params={"agent_id": cfg["agent_id"]}, headers=headers, timeout=5)
+        if r.status_code != 200:
+            return
+        commands = r.json()
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable pour les commandes : {e}")
+        return
+
+    for cmd in commands:
+        action = cmd["action"]
+        params = cmd.get("params", {})
+        print(f"[COMMANDE] {action} {params}")
+
+        if action == "isolate":
+            ok, msg = isolate_network(cfg)
+        elif action == "unisolate":
+            ok, msg = unisolate_network(cfg)
+        elif action == "kill_process":
+            ok, msg = _execute_kill_process(params.get("pid"))
+        elif action == "restore_file":
+            ok, msg = _execute_restore_file(params.get("quarantine_path"), params.get("original_path"))
+        elif action == "quarantine_file":
+            ok, msg = _execute_quarantine_file(cfg, params)
+        else:
+            ok, msg = False, f"Action inconnue : {action}"
+
+        print(f"[COMMANDE {'OK' if ok else 'ÉCHEC'}] {msg}")
+        send_command_result(cfg, cmd["id"], "done" if ok else "failed", msg)
+
+
+def _execute_kill_process(pid):
+    if not pid:
+        return False, "pid manquant"
+    try:
+        p = psutil.Process(int(pid))
+        name = p.name()
+        p.terminate()
+        p.wait(timeout=3)
+        return True, f"Processus {name} (PID {pid}) arrêté"
+    except psutil.NoSuchProcess:
+        return True, "Processus déjà arrêté"
+    except (psutil.AccessDenied, psutil.TimeoutExpired) as e:
+        return False, f"Impossible d'arrêter le processus : {e}"
+    except Exception as e:
+        return False, f"Erreur inattendue : {e}"
+
+
+def _execute_quarantine_file(cfg, params):
+    """Mise en quarantaine MANUELLE, demandée depuis le dashboard — soit
+    via un PID (on résout le chemin de l'exécutable et on arrête le
+    processus d'abord), soit via un chemin de fichier direct (aucun
+    processus à arrêter, juste le fichier)."""
+    pid = params.get("pid")
+    path = params.get("path")
+    reason = params.get("reason", "Mise en quarantaine manuelle")
+    severity = params.get("severity", "medium")
+    process_stopped = False
+    proc_name = None
+
+    if pid and not path:
+        try:
+            p = psutil.Process(int(pid))
+            proc_name = p.name()
+            path = p.exe()
+            p.terminate()
+            p.wait(timeout=3)
+            process_stopped = True
+        except psutil.NoSuchProcess:
+            return False, "Processus introuvable (déjà arrêté ?) et aucun chemin de fichier fourni"
+        except (psutil.AccessDenied, psutil.TimeoutExpired) as e:
+            return False, f"Impossible d'accéder au processus : {e}"
+
+    if not path:
+        return False, "Aucun chemin de fichier déterminé"
+
+    quarantine_path, moved = quarantine_file(path)
+    if not moved:
+        return False, f"Échec du déplacement de {path} (fichier absent ou verrouillé)"
+
+    action = "process_terminated" if process_stopped else "manual_quarantine"
+    send_quarantine(cfg, path, reason, action, severity,
+                     quarantine_path=quarantine_path, file_moved=True)
+    label = proc_name or os.path.basename(path)
+    return True, f"{label} mis en quarantaine ({path} → {quarantine_path})"
+
+
+def _execute_restore_file(quarantine_path, original_path):
+    if not quarantine_path or not original_path:
+        return False, "chemins manquants"
+    try:
+        if not os.path.exists(quarantine_path):
+            return False, "Fichier introuvable en quarantaine (peut-être déjà restauré)"
+        os.makedirs(os.path.dirname(original_path), exist_ok=True)
+        shutil.move(quarantine_path, original_path)
+        return True, f"Fichier restauré à {original_path}"
+    except Exception as e:
+        return False, f"Échec de la restauration : {e}"
+
+
+# ──────────────────────────────────────────────────────────
+# Détection : ancêtres de processus (pour la Process Timeline)
+# ──────────────────────────────────────────────────────────
+def build_process_ancestry(proc, max_levels=4):
+    chain = []
+    try:
+        current = proc
+        for _ in range(max_levels):
             try:
-                file_path = proc.exe()
+                parent = current.parent()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                file_path = f"(chemin inaccessible, PID {proc.info['pid']})"
+                parent = None
+            chain.append((current, parent))
+            if parent is None:
+                break
+            current = parent
+    except Exception:
+        pass
+    chain.reverse()
 
-            # Tentative de blocage : on arrête le processus. Le fichier lui-même
-            # n'est ni déplacé ni supprimé (pour éviter tout dégât en cas de
-            # faux positif) — seul le processus en cours d'exécution est stoppé.
-            action = "detected_only"
+    events = []
+    for child, parent in chain:
+        try:
+            child_name = child.name()
+            child_pid = child.pid
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        parent_name = parent_pid = None
+        if parent:
             try:
-                proc.terminate()
-                proc.wait(timeout=3)
-                action = "process_terminated"
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                pass  # pas les droits, ou déjà arrêté -> on garde "detected_only"
+                parent_name = parent.name()
+                parent_pid = parent.pid
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        events.append({
+            "event_type": "process", "pid": child_pid, "parent_pid": parent_pid,
+            "process_name": child_name, "parent_name": parent_name, "detail": None,
+        })
 
-            send_alert(cfg, f"Processus suspect détecté : {name}",
-                       f"{description} (PID {proc.info['pid']}) — {file_path}", severity, category)
-            send_quarantine(cfg, file_path, description, action, severity)
+    try:
+        for conn in proc.connections(kind="inet"):
+            if conn.raddr:
+                events.append({
+                    "event_type": "network", "pid": proc.pid, "parent_pid": None,
+                    "process_name": proc.name(), "parent_name": None,
+                    "detail": f"{conn.raddr.ip}:{conn.raddr.port}",
+                })
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
 
-            _already_alerted.add(name)
+    return events
+
+
+def hash_file(path, chunk_size=65536):
+    if path in _hash_cache:
+        return _hash_cache[path]
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+        _hash_cache[path] = digest
+        return digest
+    except Exception:
+        return None
+
+
+def quarantine_file(file_path):
+    """Déplace RÉELLEMENT le fichier vers le dossier de quarantaine local.
+    Retourne (quarantine_path, file_moved)."""
+    if not file_path or not os.path.exists(file_path):
+        return None, False
+    try:
+        dest_name = f"{os.path.basename(file_path)}.{int(time.time())}.quarantined"
+        dest_path = os.path.join(quarantine_dir(), dest_name)
+        shutil.move(file_path, dest_path)
+        return dest_path, True
+    except Exception as e:
+        print(f"[!] Échec du déplacement en quarantaine : {e}")
+        return None, False
+
+
+def handle_detection(cfg, proc, title, description, severity, category, reason):
+    """Point d'entrée unique pour toute détection, quelle que soit la règle
+    qui l'a déclenchée (nom connu, hash, motif de commande, LOLBin...).
+    Capture l'ascendance AVANT d'agir, arrête le processus, met le fichier
+    en quarantaine pour de vrai, puis remonte tout au serveur."""
+    try:
+        file_path = proc.exe()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        file_path = None
+
+    ancestry_events = build_process_ancestry(proc)
+    ancestry_events.append({
+        "event_type": "file", "pid": proc.pid, "parent_pid": None,
+        "process_name": proc.name() if proc.is_running() else title,
+        "parent_name": None, "detail": f"Exécutable : {file_path or 'inconnu'}",
+    })
+
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+        process_stopped = True
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+        process_stopped = False
+
+    quarantine_path, file_moved = (None, False)
+    if process_stopped and file_path:
+        quarantine_path, file_moved = quarantine_file(file_path)
+
+    action = "process_terminated" if process_stopped else "detected_only"
+
+    alert_id = send_alert(cfg, title, f"{description} — {reason}", severity, category)
+    send_quarantine(cfg, file_path or "(chemin inconnu)", reason, action, severity,
+                     quarantine_path=quarantine_path, file_moved=file_moved)
+    send_process_events(cfg, alert_id, ancestry_events)
+
+
+# ──────────────────────────────────────────────────────────
+# Boucle de détection principale
+# ──────────────────────────────────────────────────────────
+def scan_processes(cfg):
+    for proc in psutil.process_iter(["pid", "name", "ppid"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            pid = proc.info["pid"]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+        detection_key = f"{name}:{pid}"
+        if detection_key in _already_alerted:
+            continue
+
+        # 1. Liste de noms connus
+        if name in SUSPICIOUS_PROCESS_NAMES:
+            severity, category, description = SUSPICIOUS_PROCESS_NAMES[name]
+            handle_detection(cfg, proc, f"Processus suspect détecté : {name}",
+                              description, severity, category, "Nom de processus connu comme malveillant")
+            _already_alerted.add(detection_key)
+            continue
+
+        # 2. IoC — hash du fichier exécutable
+        try:
+            exe_path = proc.exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            exe_path = None
+        if exe_path:
+            digest = hash_file(exe_path)
+            if digest and digest.lower() in _iocs_cache["hash"]:
+                ioc = _iocs_cache["hash"][digest.lower()]
+                handle_detection(cfg, proc, f"Hash malveillant connu : {name}",
+                                  ioc.get("description", "Correspond à un IoC de type hash"),
+                                  ioc.get("severity", "high"), "malware",
+                                  f"SHA-256 {digest[:16]}… présent dans la base d'IoC")
+                _already_alerted.add(detection_key)
+                continue
+
+        # 3. IoC + motifs intégrés — ligne de commande
+        try:
+            cmdline = " ".join(proc.cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cmdline = ""
+        if cmdline:
+            matched = None
+            for pattern, ioc in _iocs_cache["cmdline_pattern"]:
+                if pattern.search(cmdline):
+                    matched = (ioc.get("severity", "high"), "malware", ioc.get("description", "Motif IoC"))
+                    break
+            if not matched:
+                for pattern, sev, cat, desc in BUILTIN_CMDLINE_PATTERNS:
+                    if re.search(pattern, cmdline, re.IGNORECASE):
+                        matched = (sev, cat, desc)
+                        break
+            if matched:
+                severity, category, description = matched
+                handle_detection(cfg, proc, f"Ligne de commande suspecte : {name}",
+                                  description, severity, category, "Motif détecté dans la ligne de commande")
+                _already_alerted.add(detection_key)
+                continue
+
+        # 4. LOLBins — application bureautique lançant un interpréteur de script
+        if name in SCRIPT_INTERPRETERS:
+            try:
+                parent = proc.parent()
+                parent_name = parent.name().lower() if parent else ""
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                parent_name = ""
+            if parent_name in OFFICE_APPS:
+                handle_detection(cfg, proc, f"Comportement LOLBin : {parent_name} → {name}",
+                                  "Une application bureautique a lancé un interpréteur de script — "
+                                  "signature classique de macro malveillante",
+                                  "high", "defense_evasion",
+                                  f"{parent_name} a créé le processus {name}")
+                _already_alerted.add(detection_key)
+                continue
+
+        # 5. IoC — adresses IP en connexion sortante
+        if _iocs_cache["ip"]:
+            try:
+                for conn in proc.connections(kind="inet"):
+                    if conn.raddr and conn.raddr.ip in _iocs_cache["ip"]:
+                        ioc = _iocs_cache["ip"][conn.raddr.ip]
+                        handle_detection(cfg, proc, f"Connexion vers une IP malveillante connue : {name}",
+                                          ioc.get("description", "Adresse IP présente dans la base d'IoC"),
+                                          ioc.get("severity", "high"), "network",
+                                          f"Connexion sortante vers {conn.raddr.ip}:{conn.raddr.port}")
+                        _already_alerted.add(detection_key)
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
 
 def main():
+    global _cycle_count
     cfg = get_config()
     print("── Agent NHGuard démarré ──")
     print(f"Identifiant : {cfg['agent_id']}")
     print(f"Serveur     : {cfg['server_url']}")
+    print(f"Quarantaine : {quarantine_dir()}")
     print(f"Config      : {config_path()}")
     print("Ctrl+C pour arrêter.\n")
+
+    fetch_iocs(cfg)
 
     while True:
         stats = collect_system_stats(cfg["agent_id"])
         send_heartbeat(cfg, stats)
         scan_processes(cfg)
+        poll_and_execute_commands(cfg)
+
+        _cycle_count += 1
+        if _cycle_count % IOC_REFRESH_EVERY_N_CYCLES == 0:
+            fetch_iocs(cfg)
+
         print(f"[{time.strftime('%H:%M:%S')}] CPU {stats['cpu_percent']}% · "
               f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}%")
         time.sleep(REPORT_INTERVAL_SECONDS)
