@@ -1,0 +1,712 @@
+"""
+Base de données des alertes et agents EDR — multi-tenant.
+
+Fichier SQLite indépendant de la base des comptes (edr_users.db) : edr_data.db.
+Chaque ligne (agent, alerte) est taguée par org_id : toutes les fonctions
+de lecture exigent un org_id et ne renvoient JAMAIS de données d'une
+autre organisation. C'est cette discipline qui garantit l'isolation
+entre clients du SaaS.
+"""
+
+import sqlite3
+import json
+import random
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+
+DB_PATH = "edr_data.db"
+
+
+@contextmanager
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id       TEXT NOT NULL,
+                org_id         INTEGER NOT NULL,
+                status         TEXT NOT NULL,
+                cpu_percent    REAL DEFAULT 0,
+                ram_percent    REAL DEFAULT 0,
+                disk_percent   REAL DEFAULT 0,
+                os             TEXT,
+                last_seen      TEXT,
+                process_count  INTEGER DEFAULT 0,
+                cpu_model      TEXT,
+                ram_total_gb   REAL DEFAULT 0,
+                local_ip       TEXT,
+                public_ip      TEXT,
+                geo_city       TEXT,
+                geo_region     TEXT,
+                geo_country    TEXT,
+                logged_in_user TEXT,
+                processes      TEXT,   -- JSON: liste des processus en cours (snapshot)
+                is_demo        INTEGER NOT NULL DEFAULT 0,
+                isolated       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, org_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id             TEXT PRIMARY KEY,
+                org_id         INTEGER NOT NULL,
+                title          TEXT NOT NULL,
+                description    TEXT,
+                severity       TEXT NOT NULL,
+                score          INTEGER NOT NULL DEFAULT 0,
+                category       TEXT,
+                agent_id       TEXT,
+                timestamp      TEXT NOT NULL,
+                acknowledged   INTEGER NOT NULL DEFAULT 0,
+                is_demo        INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quarantine (
+                id             TEXT PRIMARY KEY,
+                org_id         INTEGER NOT NULL,
+                agent_id       TEXT NOT NULL,
+                file_path      TEXT NOT NULL,
+                file_name      TEXT,
+                reason         TEXT,
+                action         TEXT NOT NULL,   -- 'process_terminated' / 'detected_only'
+                severity       TEXT NOT NULL,
+                timestamp      TEXT NOT NULL,
+                restored       INTEGER NOT NULL DEFAULT 0,
+                is_demo        INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS process_events (
+                id             TEXT PRIMARY KEY,
+                org_id         INTEGER NOT NULL,
+                agent_id       TEXT NOT NULL,
+                alert_id       TEXT,             -- rattache l'évènement à une alerte (arbre)
+                event_type     TEXT NOT NULL,    -- process / file / network / registry
+                pid            INTEGER,
+                parent_pid     INTEGER,
+                process_name   TEXT,
+                parent_name    TEXT,
+                detail         TEXT,             -- chemin de fichier, IP:port, etc.
+                timestamp      TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS commands (
+                id             TEXT PRIMARY KEY,
+                org_id         INTEGER NOT NULL,
+                agent_id       TEXT NOT NULL,
+                action         TEXT NOT NULL,    -- isolate / unisolate / kill_process / quarantine_file / restore_file
+                params         TEXT,             -- JSON, ex: {"pid": 1234} ou {"path": "C:\\...", "quarantine_path": "..."}
+                status         TEXT NOT NULL DEFAULT 'pending',  -- pending / done / failed
+                result         TEXT,
+                created_at     TEXT NOT NULL,
+                executed_at    TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS iocs (
+                id             TEXT PRIMARY KEY,
+                org_id         INTEGER NOT NULL,
+                type           TEXT NOT NULL,    -- hash / ip / cmdline_pattern
+                value          TEXT NOT NULL,
+                severity       TEXT NOT NULL DEFAULT 'high',
+                description    TEXT,
+                is_demo        INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_procevents_alert ON process_events(org_id, alert_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_commands_agent_status ON commands(org_id, agent_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_iocs_org ON iocs(org_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_quarantine_org_ts ON quarantine(org_id, timestamp DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_org_ts ON alerts(org_id, timestamp DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_org_sev ON alerts(org_id, severity)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id)")
+
+        # Migration douce : si edr_data.db existait déjà avant l'ajout de ces
+        # colonnes, on les ajoute sans effacer les données existantes.
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(agents)")}
+        for col, coltype in [
+            ("cpu_model", "TEXT"), ("ram_total_gb", "REAL DEFAULT 0"),
+            ("local_ip", "TEXT"), ("logged_in_user", "TEXT"), ("processes", "TEXT"),
+            ("is_demo", "INTEGER NOT NULL DEFAULT 0"), ("isolated", "INTEGER NOT NULL DEFAULT 0"),
+            ("public_ip", "TEXT"), ("geo_city", "TEXT"), ("geo_region", "TEXT"), ("geo_country", "TEXT"),
+        ]:
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {coltype}")
+
+        for table in ("alerts", "quarantine"):
+            cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "is_demo" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+
+        quarantine_cols = {row["name"] for row in conn.execute("PRAGMA table_info(quarantine)")}
+        if "quarantine_path" not in quarantine_cols:
+            conn.execute("ALTER TABLE quarantine ADD COLUMN quarantine_path TEXT")
+        if "file_moved" not in quarantine_cols:
+            conn.execute("ALTER TABLE quarantine ADD COLUMN file_moved INTEGER NOT NULL DEFAULT 0")
+
+        alert_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+        if "score" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN score INTEGER NOT NULL DEFAULT 0")
+            # Rétro-calcule un score pour les alertes déjà existantes
+            for sev, sc in [("critical", 9), ("high", 6), ("medium", 4), ("low", 2)]:
+                conn.execute("UPDATE alerts SET score = ? WHERE severity = ? AND score = 0", (sc, sev))
+
+
+SEVERITY_SCORE = {"critical": 9, "high": 6, "medium": 4, "low": 2}
+
+
+# ──────────────────────────────────────────────────────────
+# Agents (toujours filtrés par org_id)
+# ──────────────────────────────────────────────────────────
+def get_agents(org_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agents WHERE org_id = ? ORDER BY agent_id", (org_id,)
+        ).fetchall()
+        agents = []
+        for r in rows:
+            a = dict(r)
+            try:
+                a["processes"] = json.loads(a["processes"]) if a.get("processes") else []
+            except (TypeError, json.JSONDecodeError):
+                a["processes"] = []
+            agents.append(a)
+        return agents
+
+
+def upsert_agent(org_id, agent_id, status, cpu_percent, ram_percent, disk_percent, os_name,
+                  process_count, cpu_model=None, ram_total_gb=0, local_ip=None,
+                  logged_in_user=None, processes=None, is_demo=False,
+                  public_ip=None, geo_city=None, geo_region=None, geo_country=None):
+    """Le champ isolated N'EST PAS écrasé ici : le statut d'isolement est géré
+    séparément par set_agent_isolated(), pour ne pas être effacé à chaque
+    heartbeat normal de l'agent."""
+    processes_json = json.dumps(processes or [])
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO agents (agent_id, org_id, status, cpu_percent, ram_percent, disk_percent, os,
+                                 last_seen, process_count, cpu_model, ram_total_gb, local_ip,
+                                 logged_in_user, processes, is_demo, public_ip, geo_city, geo_region, geo_country)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, org_id) DO UPDATE SET
+                status=excluded.status, cpu_percent=excluded.cpu_percent,
+                ram_percent=excluded.ram_percent, disk_percent=excluded.disk_percent,
+                os=excluded.os, last_seen=excluded.last_seen, process_count=excluded.process_count,
+                cpu_model=excluded.cpu_model, ram_total_gb=excluded.ram_total_gb,
+                local_ip=excluded.local_ip, logged_in_user=excluded.logged_in_user,
+                processes=excluded.processes, is_demo=excluded.is_demo,
+                public_ip=excluded.public_ip, geo_city=excluded.geo_city,
+                geo_region=excluded.geo_region, geo_country=excluded.geo_country
+        """, (agent_id, org_id, status, cpu_percent, ram_percent, disk_percent, os_name,
+              datetime.utcnow().isoformat(timespec="seconds"), process_count,
+              cpu_model, ram_total_gb, local_ip, logged_in_user, processes_json,
+              1 if is_demo else 0, public_ip, geo_city, geo_region, geo_country))
+
+
+def set_agent_isolated(org_id, agent_id, isolated: bool):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE agents SET isolated = ? WHERE org_id = ? AND agent_id = ?",
+            (1 if isolated else 0, org_id, agent_id),
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# Alertes (toujours filtrées par org_id)
+# ──────────────────────────────────────────────────────────
+def get_alerts(org_id, severity=None, limit=50):
+    with get_connection() as conn:
+        if severity and severity != "all":
+            rows = conn.execute(
+                "SELECT * FROM alerts WHERE org_id = ? AND severity = ? ORDER BY timestamp DESC LIMIT ?",
+                (org_id, severity, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM alerts WHERE org_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (org_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_alert(org_id, title, description, severity, category, agent_id, is_demo=False, score=None):
+    alert_id = str(uuid.uuid4())
+    if score is None:
+        score = SEVERITY_SCORE.get(severity, 1)
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO alerts (id, org_id, title, description, severity, score, category, agent_id, timestamp, acknowledged, is_demo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (alert_id, org_id, title, description, severity, score, category, agent_id,
+              datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0))
+    return alert_id
+
+
+def ack_alert(org_id, alert_id):
+    """org_id est vérifié dans la clause WHERE : impossible d'acquitter
+    l'alerte d'une autre organisation même en devinant son id."""
+    with get_connection() as conn:
+        conn.execute("UPDATE alerts SET acknowledged = 1 WHERE id = ? AND org_id = ?", (alert_id, org_id))
+
+
+# ──────────────────────────────────────────────────────────
+# Quarantaine (fichiers/processus bloqués)
+# ──────────────────────────────────────────────────────────
+def get_quarantine(org_id, limit=100):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM quarantine WHERE org_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (org_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_quarantine_item(org_id, agent_id, file_path, reason, action, severity,
+                            is_demo=False, quarantine_path=None, file_moved=False):
+    item_id = str(uuid.uuid4())
+    file_name = file_path.replace("\\", "/").split("/")[-1] if file_path else "inconnu"
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO quarantine
+                (id, org_id, agent_id, file_path, file_name, reason, action, severity,
+                 timestamp, restored, is_demo, quarantine_path, file_moved)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """, (item_id, org_id, agent_id, file_path, file_name, reason, action, severity,
+              datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0,
+              quarantine_path, 1 if file_moved else 0))
+    return item_id
+
+
+def get_quarantine_item(org_id, item_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM quarantine WHERE id = ? AND org_id = ?", (item_id, org_id)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def restore_quarantine_item(org_id, item_id):
+    """Marque un élément comme 'restauré' (ex: faux positif). Ne relance
+    pas le processus ni ne déplace de fichier — c'est un statut administratif.
+    Pour un vrai retour du fichier à sa place, voir restore_quarantined_file()
+    côté serveur (qui dépose une commande 'restore_file' pour l'agent)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE quarantine SET restored = 1 WHERE id = ? AND org_id = ?", (item_id, org_id)
+        )
+
+
+def clear_demo_data(org_id):
+    """Efface UNIQUEMENT les données marquées comme démo pour cette
+    organisation — les vraies données d'agents ne sont jamais touchées."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM agents WHERE org_id = ? AND is_demo = 1", (org_id,))
+        conn.execute("DELETE FROM alerts WHERE org_id = ? AND is_demo = 1", (org_id,))
+        conn.execute("DELETE FROM quarantine WHERE org_id = ? AND is_demo = 1", (org_id,))
+        conn.execute("DELETE FROM process_events WHERE org_id = ? AND alert_id IN "
+                     "(SELECT id FROM alerts WHERE org_id = ? AND is_demo = 1)", (org_id, org_id))
+        conn.execute("DELETE FROM iocs WHERE org_id = ? AND is_demo = 1", (org_id,))
+
+
+# ──────────────────────────────────────────────────────────
+# Commandes à distance (isolation, kill process, quarantaine/restauration
+# de fichier) — file d'attente que l'agent consomme à chaque heartbeat.
+# ──────────────────────────────────────────────────────────
+def create_command(org_id, agent_id, action, params=None):
+    """Actions volontairement limitées à des interventions précises,
+    tracées et réversibles — jamais une exécution de commande arbitraire."""
+    cmd_id = str(uuid.uuid4())
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO commands (id, org_id, agent_id, action, params, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """, (cmd_id, org_id, agent_id, action, json.dumps(params or {}),
+              datetime.utcnow().isoformat(timespec="seconds")))
+    return cmd_id
+
+
+def get_pending_commands(org_id, agent_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM commands WHERE org_id = ? AND agent_id = ? AND status = 'pending' ORDER BY created_at",
+            (org_id, agent_id),
+        ).fetchall()
+        out = []
+        for r in rows:
+            c = dict(r)
+            try:
+                c["params"] = json.loads(c["params"]) if c["params"] else {}
+            except (TypeError, json.JSONDecodeError):
+                c["params"] = {}
+            out.append(c)
+        return out
+
+
+def get_command(org_id, command_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM commands WHERE id = ? AND org_id = ?", (command_id, org_id)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def complete_command(org_id, command_id, status, result=""):
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE commands SET status = ?, result = ?, executed_at = ?
+            WHERE id = ? AND org_id = ?
+        """, (status, result, datetime.utcnow().isoformat(timespec="seconds"), command_id, org_id))
+
+
+def get_recent_commands(org_id, agent_id=None, limit=50):
+    with get_connection() as conn:
+        if agent_id:
+            rows = conn.execute(
+                "SELECT * FROM commands WHERE org_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT ?",
+                (org_id, agent_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM commands WHERE org_id = ? ORDER BY created_at DESC LIMIT ?",
+                (org_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────
+# IoC — Indicateurs de Compromission (moteur de détection par règles)
+# ──────────────────────────────────────────────────────────
+def create_ioc(org_id, ioc_type, value, severity="high", description="", is_demo=False):
+    ioc_id = str(uuid.uuid4())
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO iocs (id, org_id, type, value, severity, description, is_demo, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ioc_id, org_id, ioc_type, value, severity, description,
+              1 if is_demo else 0, datetime.utcnow().isoformat(timespec="seconds")))
+    return ioc_id
+
+
+def get_iocs(org_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM iocs WHERE org_id = ? ORDER BY created_at DESC", (org_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_ioc(org_id, ioc_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM iocs WHERE id = ? AND org_id = ?", (ioc_id, org_id))
+
+
+# ──────────────────────────────────────────────────────────
+# Évènements de processus (arbre d'exécution / Process Timeline)
+# ──────────────────────────────────────────────────────────
+def create_process_event(org_id, agent_id, alert_id, event_type, pid=None, parent_pid=None,
+                          process_name=None, parent_name=None, detail=None):
+    event_id = str(uuid.uuid4())
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO process_events
+                (id, org_id, agent_id, alert_id, event_type, pid, parent_pid, process_name, parent_name, detail, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (event_id, org_id, agent_id, alert_id, event_type, pid, parent_pid,
+              process_name, parent_name, detail, datetime.utcnow().isoformat(timespec="seconds")))
+    return event_id
+
+
+def get_process_tree(org_id, alert_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM process_events WHERE org_id = ? AND alert_id = ? ORDER BY timestamp",
+            (org_id, alert_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────
+# Investigate : agrégations par catégorie, façon "query builder"
+# ──────────────────────────────────────────────────────────
+def get_investigate_aggregations(org_id):
+    with get_connection() as conn:
+        def counts(sql, params):
+            return [{"label": r[0] or "—", "count": r[1]}
+                    for r in conn.execute(sql, params).fetchall() if r[0] is not None]
+
+        by_category = counts(
+            "SELECT category, COUNT(*) c FROM alerts WHERE org_id = ? GROUP BY category ORDER BY c DESC",
+            (org_id,),
+        )
+        by_severity = counts(
+            "SELECT severity, COUNT(*) c FROM alerts WHERE org_id = ? GROUP BY severity ORDER BY c DESC",
+            (org_id,),
+        )
+        by_agent = counts(
+            "SELECT agent_id, COUNT(*) c FROM alerts WHERE org_id = ? GROUP BY agent_id ORDER BY c DESC LIMIT 10",
+            (org_id,),
+        )
+        by_os = counts(
+            "SELECT os, COUNT(*) c FROM agents WHERE org_id = ? GROUP BY os ORDER BY c DESC",
+            (org_id,),
+        )
+        by_user = counts(
+            "SELECT logged_in_user, COUNT(*) c FROM agents WHERE org_id = ? AND logged_in_user IS NOT NULL GROUP BY logged_in_user ORDER BY c DESC",
+            (org_id,),
+        )
+        return {
+            "categorie": by_category,
+            "severite": by_severity,
+            "agent": by_agent,
+            "os": by_os,
+            "utilisateur": by_user,
+        }
+
+
+def get_stats(org_id):
+    with get_connection() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM alerts WHERE org_id = ?", (org_id,)).fetchone()["c"]
+        non_ack = conn.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0", (org_id,)
+        ).fetchone()["c"]
+
+        by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for row in conn.execute(
+            "SELECT severity, COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0 GROUP BY severity",
+            (org_id,),
+        ):
+            if row["severity"] in by_sev:
+                by_sev[row["severity"]] = row["c"]
+
+        by_cat = {}
+        for row in conn.execute(
+            "SELECT category, COUNT(*) c FROM alerts WHERE org_id = ? GROUP BY category", (org_id,)
+        ):
+            by_cat[row["category"] or "autre"] = row["c"]
+
+        since_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat(timespec="seconds")
+        last_24h = conn.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE org_id = ? AND timestamp >= ?", (org_id, since_24h)
+        ).fetchone()["c"]
+
+        agents_total = conn.execute(
+            "SELECT COUNT(*) c FROM agents WHERE org_id = ?", (org_id,)
+        ).fetchone()["c"]
+        agents_actifs = conn.execute(
+            "SELECT COUNT(*) c FROM agents WHERE org_id = ? AND status = 'active'", (org_id,)
+        ).fetchone()["c"]
+        agents_reels = conn.execute(
+            "SELECT COUNT(*) c FROM agents WHERE org_id = ? AND is_demo = 0", (org_id,)
+        ).fetchone()["c"]
+        a_des_donnees_demo = conn.execute(
+            "SELECT COUNT(*) c FROM agents WHERE org_id = ? AND is_demo = 1", (org_id,)
+        ).fetchone()["c"] > 0
+
+        return {
+            "total": total, "non_acquittees": non_ack,
+            "critical": by_sev["critical"], "high": by_sev["high"],
+            "medium": by_sev["medium"], "low": by_sev["low"],
+            "par_categorie": by_cat, "last_24h": last_24h,
+            "agents_total": agents_total, "agents_actifs": agents_actifs,
+            "agents_reels": agents_reels, "a_des_donnees_demo": a_des_donnees_demo,
+        }
+
+
+# ──────────────────────────────────────────────────────────
+# Données de démonstration (toujours scopées à une org_id)
+# ──────────────────────────────────────────────────────────
+DEMO_AGENTS = [
+    ("WKS-COMPTA-01", "active", "Windows 11 Pro"),
+    ("WKS-DIRECTION-02", "active", "Windows 11 Pro"),
+    ("SRV-FILE-01", "active", "Windows Server 2022"),
+    ("SRV-DB-01", "active", "Ubuntu 22.04 LTS"),
+    ("WKS-RH-03", "offline", "Windows 10 Pro"),
+    ("LAPTOP-COMMERCIAL-07", "active", "Windows 11 Pro"),
+]
+
+DEMO_ALERTS = [
+    ("Comportement ransomware détecté", "Chiffrement massif de fichiers détecté dans un répertoire utilisateur", "critical", "ransomware"),
+    ("Élévation de privilèges suspecte", "Un processus a tenté d'obtenir des droits administrateur de façon inhabituelle", "critical", "privilege_escalation"),
+    ("Connexion à un C2 connu", "Trafic réseau sortant vers une adresse IP répertoriée comme serveur de commande et contrôle", "critical", "network"),
+    ("Script PowerShell obfusqué exécuté", "Exécution d'un script encodé en base64 avec des techniques d'évasion", "high", "malware"),
+    ("Tentative d'accès à LSASS", "Un processus a tenté de lire la mémoire du processus LSASS (vol d'identifiants)", "high", "credential_access"),
+    ("Fichier exécutable suspect en pièce jointe", "Un fichier .exe déguisé en document a été ouvert depuis un email", "high", "phishing"),
+    ("Désactivation de Windows Defender", "Le service antivirus a été désactivé par un utilisateur non administrateur", "high", "defense_evasion"),
+    ("Connexion à heure inhabituelle", "Connexion utilisateur détectée à 3h47 du matin, hors des horaires habituels", "medium", "anomaly"),
+    ("Nouvelle règle de pare-feu ajoutée", "Une règle autorisant du trafic entrant a été créée manuellement", "medium", "configuration"),
+    ("Multiples échecs d'authentification", "5 tentatives de connexion échouées en moins d'une minute", "medium", "brute_force"),
+    ("Périphérique USB non autorisé connecté", "Une clé USB inconnue a été branchée sur un poste sensible", "medium", "device"),
+    ("Mise à jour logicielle installée", "Une mise à jour de sécurité a été appliquée avec succès", "low", "maintenance"),
+    ("Scan de vulnérabilités planifié terminé", "Le scan hebdomadaire s'est terminé sans anomalie critique", "low", "scan"),
+    ("Nouvelle politique de mot de passe appliquée", "La politique de complexité des mots de passe a été mise à jour", "low", "configuration"),
+]
+
+
+DEMO_PROCESS_NAMES = [
+    "explorer.exe", "chrome.exe", "svchost.exe", "outlook.exe", "Teams.exe",
+    "winlogon.exe", "spoolsv.exe", "SearchIndexer.exe", "dwm.exe", "csrss.exe",
+    "MsMpEng.exe", "OneDrive.exe", "excel.exe", "RuntimeBroker.exe", "taskhostw.exe",
+]
+DEMO_USERS = ["j.dupont", "m.martin", "administrateur", "svc-backup", "a.bernard"]
+DEMO_CPU_MODELS = [
+    "Intel Core i7-12700 @ 2.10GHz", "Intel Core i5-11400 @ 2.60GHz",
+    "AMD Ryzen 5 5600X @ 3.70GHz", "Intel Xeon E5-2680 @ 2.40GHz",
+]
+
+
+def _fake_processes(n=12):
+    return [
+        {
+            "pid": random.randint(500, 30000),
+            "name": random.choice(DEMO_PROCESS_NAMES),
+            "user": random.choice(DEMO_USERS),
+            "cpu_percent": round(random.uniform(0, 25), 1),
+            "memory_percent": round(random.uniform(0.1, 15), 1),
+        }
+        for _ in range(n)
+    ]
+
+
+def seed_demo(org_id):
+    """Efface UNIQUEMENT l'ancienne démo de cette organisation (pas les
+    vraies données), puis (re)crée des données de démo fraîches, marquées
+    is_demo=1 pour pouvoir être effacées proprement plus tard."""
+    clear_demo_data(org_id)
+
+    DEMO_GEO = [
+        ("88.174.23.10", "Paris", "Île-de-France", "France"),
+        ("90.12.45.201", "Lyon", "Auvergne-Rhône-Alpes", "France"),
+        ("176.152.30.44", "Marseille", "Provence-Alpes-Côte d'Azur", "France"),
+        ("78.192.55.87", "Toulouse", "Occitanie", "France"),
+        ("82.65.14.203", "Lille", "Hauts-de-France", "France"),
+    ]
+
+    for i, (agent_id, status, os_name) in enumerate(DEMO_AGENTS):
+        cpu = random.uniform(5, 95) if status == "active" else 0
+        ram = random.uniform(20, 90) if status == "active" else 0
+        disk = random.uniform(30, 85)
+        pub_ip, city, region, country = DEMO_GEO[i % len(DEMO_GEO)]
+        upsert_agent(
+            org_id, agent_id, status, cpu, ram, disk, os_name, random.randint(40, 260),
+            cpu_model=random.choice(DEMO_CPU_MODELS),
+            ram_total_gb=random.choice([8, 16, 32]),
+            local_ip=f"192.168.1.{10 + i}",
+            logged_in_user=random.choice(DEMO_USERS) if status == "active" else None,
+            processes=_fake_processes() if status == "active" else [],
+            is_demo=True,
+            public_ip=pub_ip if status == "active" else None,
+            geo_city=city if status == "active" else None,
+            geo_region=region if status == "active" else None,
+            geo_country=country if status == "active" else None,
+        )
+    # Un agent de démo isolé, pour visualiser l'état "isolé" dans le dashboard
+    active_agents_names = [a for a, s, _ in DEMO_AGENTS if s == "active"]
+    if active_agents_names:
+        set_agent_isolated(org_id, active_agents_names[0], True)
+
+    active_agents = [a for a, s, _ in DEMO_AGENTS if s == "active"]
+    now = datetime.utcnow()
+    demo_alerts_info = []  # (alert_id, severity, agent_id, category)
+    with get_connection() as conn:
+        for title, desc, sev, cat in DEMO_ALERTS:
+            alert_id = str(uuid.uuid4())
+            chosen_agent = random.choice(active_agents)
+            demo_alerts_info.append((alert_id, sev, chosen_agent, cat))
+            ts = (now - timedelta(minutes=random.randint(1, 2000))).isoformat(timespec="seconds")
+            acknowledged = 1 if random.random() < 0.25 else 0
+            conn.execute("""
+                INSERT INTO alerts (id, org_id, title, description, severity, score, category, agent_id, timestamp, acknowledged, is_demo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (alert_id, org_id, title, desc, sev, SEVERITY_SCORE.get(sev, 1), cat,
+                  chosen_agent, ts, acknowledged))
+
+    # Arbre d'exécution de démo, rattaché à TOUTES les alertes critiques/hautes
+    # (pas seulement la première) — pour que la Process Timeline montre
+    # quelque chose quel que soit l'alerte cliquée dans la démo.
+    DEMO_CHAINS_BY_CATEGORY = {
+        "ransomware": [
+            ("process", 1002, None, "explorer.exe", None, None),
+            ("process", 5120, 1002, "powershell.exe", "explorer.exe", "-ExecutionPolicy Bypass -EncodedCommand ..."),
+            ("file", 5120, None, "powershell.exe", None, r"C:\Windows\Temp\payload.exe créé"),
+            ("process", 6244, 5120, "payload.exe", "powershell.exe", None),
+            ("network", 6244, None, "payload.exe", None, "185.199.108.1:4444 (connexion sortante)"),
+        ],
+        "privilege_escalation": [
+            ("process", 2210, None, "svchost.exe", None, None),
+            ("process", 4488, 2210, "cmd.exe", "svchost.exe", "/c whoami /priv"),
+            ("process", 4501, 4488, "psexec.exe", "cmd.exe", "-accepteula \\\\DC01 -s cmd.exe"),
+        ],
+        "network": [
+            ("process", 1188, None, "explorer.exe", None, None),
+            ("process", 3390, 1188, "chrome.exe", "explorer.exe", None),
+            ("network", 3390, None, "chrome.exe", None, "185.199.108.1:443 (connexion C2 suspectée)"),
+        ],
+        "malware": [
+            ("process", 1002, None, "outlook.exe", None, None),
+            ("process", 5544, 1002, "winword.exe", "outlook.exe", "facture_urgente.docm"),
+            ("process", 5601, 5544, "powershell.exe", "winword.exe", "-enc SGVsbG8gV29ybGQh..."),
+            ("file", 5601, None, "powershell.exe", None, r"C:\Users\Public\update.exe créé"),
+        ],
+        "credential_access": [
+            ("process", 640, None, "lsass.exe", None, None),
+            ("process", 7712, 4488, "mimikatz.exe", "cmd.exe", "sekurlsa::logonpasswords"),
+            ("file", 7712, None, "mimikatz.exe", None, r"C:\Users\Public\creds.txt créé"),
+        ],
+        "defense_evasion": [
+            ("process", 2210, None, "services.exe", None, None),
+            ("process", 3312, 2210, "cmd.exe", "services.exe", "/c sc stop WinDefend"),
+        ],
+    }
+    for alert_id, sev, agent_id, cat in demo_alerts_info:
+        if sev not in ("critical", "high"):
+            continue
+        chain = DEMO_CHAINS_BY_CATEGORY.get(cat, DEMO_CHAINS_BY_CATEGORY["network"])
+        for event_type, pid, parent_pid, name, parent_name, detail in chain:
+            create_process_event(
+                org_id, agent_id, alert_id, event_type,
+                pid=pid, parent_pid=parent_pid, process_name=name,
+                parent_name=parent_name, detail=detail,
+            )
+
+    DEMO_QUARANTINE = [
+        (r"C:\Users\jean.dupont\Downloads\facture_urgente.exe", "Signature ransomware connue", "critical", "process_terminated"),
+        (r"C:\Windows\Temp\mimikatz.exe", "Outil de vol d'identifiants", "critical", "process_terminated"),
+        (r"C:\Users\m.martin\AppData\Local\Temp\update_flash.exe", "Comportement de type cheval de Troie", "high", "process_terminated"),
+        (r"C:\Users\a.bernard\Downloads\rapport_2024.docm", "Macro Office suspecte", "medium", "detected_only"),
+        (r"C:\ProgramData\svc_helper.dll", "DLL non signée injectée dans un processus système", "high", "process_terminated"),
+    ]
+    for file_path, reason, sev, action in DEMO_QUARANTINE:
+        # is_moved=True pour la démo : simule un vrai déplacement de fichier
+        # (en réalité, aucun fichier n'existe sur le disque, c'est juste pour
+        # montrer le statut "Fichier déplacé" dans l'interface).
+        moved = action == "process_terminated"
+        qpath = f"C:\\ProgramData\\NHGuard\\Quarantine\\{file_path.split(chr(92))[-1]}.quarantined" if moved else None
+        create_quarantine_item(
+            org_id, random.choice(active_agents), file_path, reason, action, sev,
+            is_demo=True, quarantine_path=qpath, file_moved=moved,
+        )
+
+    DEMO_IOCS = [
+        ("hash", "44d88612fea8a8f36de82e1278abb02f", "critical", "Hash connu — famille de ransomware (EICAR test)"),
+        ("ip", "185.199.108.1", "high", "Adresse IP de serveur C2 connu"),
+        ("cmdline_pattern", r"-enc.*JAB", "high", "Commande PowerShell encodée en base64 (pattern classique)"),
+        ("cmdline_pattern", r"IEX\s*\(New-Object", "critical", "Téléchargement + exécution PowerShell en mémoire"),
+    ]
+    for ioc_type, value, sev, desc in DEMO_IOCS:
+        create_ioc(org_id, ioc_type, value, severity=sev, description=desc, is_demo=True)
