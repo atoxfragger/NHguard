@@ -44,9 +44,9 @@ GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleuse
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "nailhabi12@gmail.com"
-SMTP_PASSWORD = "bqse hfbt sbji bbgo"
-SMTP_FROM_NAME = "NHGuard"
+SMTP_USER = "..."
+SMTP_PASSWORD = "..."
+SMTP_FROM_NAME = "NHguard"
 
 
 def send_verification_email(to_email: str, code: str):
