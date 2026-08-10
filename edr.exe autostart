@@ -1,0 +1,67 @@
+@echo off
+REM ──────────────────────────────────────────────────────────
+REM install_autostart_exe.bat — fait démarrer EDRAgent.exe
+REM automatiquement à chaque connexion Windows.
+REM
+REM À utiliser SI VOUS DISTRIBUEZ L'AGENT COMPILÉ (.exe) À DES
+REM CLIENTS, plutôt que le script .py + Python installé.
+REM
+REM Placez ce fichier .bat à côté de EDRAgent.exe (ou dans le
+REM dossier dist\ généré par build_agent.bat), puis double-cliquez.
+REM ──────────────────────────────────────────────────────────
+
+setlocal
+
+set SCRIPT_DIR=%~dp0
+set EXE_PATH=%SCRIPT_DIR%EDRAgent.exe
+
+REM Si l'exe n'est pas à côté du .bat, on regarde dans .\dist\
+REM (l'emplacement par défaut généré par build_agent.bat)
+if not exist "%EXE_PATH%" (
+    if exist "%SCRIPT_DIR%dist\EDRAgent.exe" (
+        set EXE_PATH=%SCRIPT_DIR%dist\EDRAgent.exe
+    )
+)
+
+if not exist "%EXE_PATH%" (
+    echo.
+    echo ERREUR : EDRAgent.exe introuvable.
+    echo Verifiez qu'il se trouve dans le meme dossier que ce .bat,
+    echo ou dans un sous-dossier "dist".
+    echo Si l'exe n'a pas encore ete cree, lancez d'abord build_agent.bat.
+    pause
+    exit /b 1
+)
+
+echo Executable trouve : %EXE_PATH%
+echo.
+echo Creation de la tache planifiee "EDRAgent"...
+
+schtasks /create /tn "EDRAgent" /tr "\"%EXE_PATH%\"" /sc onlogon /rl highest /f
+
+if %errorlevel% neq 0 (
+    echo.
+    echo ERREUR lors de la creation de la tache. Essayez de lancer ce
+    echo fichier .bat en tant qu'administrateur ^(clic droit -^> Executer
+    echo en tant qu'administrateur^).
+    pause
+    exit /b 1
+)
+
+echo.
+echo ──────────────────────────────────────────────
+echo Termine ! EDRAgent.exe demarrera desormais
+echo automatiquement a chaque connexion Windows.
+echo.
+echo Lancement immediat ^(la fenetre de configuration
+echo apparaitra si c'est la premiere fois sur ce poste^) :
+schtasks /run /tn "EDRAgent"
+echo.
+echo Pour verifier qu'il tourne : Gestionnaire des taches
+echo -^> onglet Details -^> cherchez "EDRAgent.exe"
+echo.
+echo Pour desinstaller le demarrage automatique plus tard,
+echo utilisez uninstall_autostart.bat ^(meme fichier que pour
+echo la version .py, le nom de tache est identique^).
+echo ──────────────────────────────────────────────
+pause
