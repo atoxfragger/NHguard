@@ -1,0 +1,627 @@
+
+
+import os
+import random
+import secrets
+import smtplib
+import time
+from email.mime.text import MIMEText
+from functools import wraps
+
+from flask import Flask, request, jsonify, send_from_directory, abort
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+
+import db_users
+import db_data
+
+app = Flask(__name__)
+CORS(app)
+
+db_users.init_db()
+db_data.init_db()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.route("/")
+def index():
+    return send_from_directory(BASE_DIR, "register.html")
+
+
+@app.route("/<path:filename>")
+def static_html(filename):
+    if not filename.endswith(".html") or "/" in filename or "\\" in filename:
+        abort(404)
+    full_path = os.path.join(BASE_DIR, filename)
+    if not os.path.isfile(full_path):
+        abort(404)
+    return send_from_directory(BASE_DIR, filename)
+
+GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleusercontent.com"
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_USER = "nailhabi12@gmail.com"
+SMTP_PASSWORD = "bqse hfbt sbji bbgo"
+SMTP_FROM_NAME = "NHGuard"
+
+
+def send_verification_email(to_email: str, code: str):
+    msg = MIMEText(
+        f"Votre code de vérification NHGuard est : {code}\n\n"
+        f"Il expire dans 5 minutes. Si vous n'êtes pas à l'origine de cette "
+        f"demande de connexion, ignorez cet e-mail."
+    )
+    msg["Subject"] = f"{code} — Code de vérification NHGuard"
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
+    msg["To"] = to_email
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [to_email], msg.as_string())
+
+
+PENDING_2FA = {}   # temp_token -> {"email": ..., "org_id": ..., "code": ..., "expires": ...}
+SESSIONS = {}       # session_token -> {"email": ..., "org_id": ..., "expires": ...}
+
+TEMP_TOKEN_TTL    = 5 * 60
+SESSION_TOKEN_TTL = 8 * 60 * 60
+
+
+def _cleanup_expired():
+    now = time.time()
+    for store in (PENDING_2FA, SESSIONS):
+        for token in [t for t, v in store.items() if v["expires"] < now]:
+            del store[token]
+
+
+def _extract_token():
+    auth = request.headers.get("Authorization", "")
+    return auth.split("Bearer ")[-1] if auth.startswith("Bearer ") else None
+
+
+def _start_2fa(email, org_id):
+    """Génère un code à 6 chiffres, l'envoie par email, et renvoie le temp_token."""
+    code = f"{random.randint(0, 999999):06d}"
+    temp_token = secrets.token_urlsafe(32)
+    PENDING_2FA[temp_token] = {
+        "email": email, "org_id": org_id, "code": code,
+        "expires": time.time() + TEMP_TOKEN_TTL,
+    }
+    try:
+        send_verification_email(email, code)
+    except Exception as e:
+        print(f"[!] Échec d'envoi de l'email à {email} : {e}")
+    return temp_token
+
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        _cleanup_expired()
+        token = _extract_token()
+        session = SESSIONS.get(token)
+        if not session or session["expires"] < time.time():
+            return jsonify({"error": "Non authentifié"}), 401
+        request.org_id = session["org_id"]
+        request.user_email = session["email"]
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_agent_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-Agent-Key")
+        org = db_users.get_organization_by_agent_key(key) if key else None
+        if not org:
+            return jsonify({"error": "Clé agent invalide"}), 401
+        request.org_id = org["id"]
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json(force=True) or {}
+    org_name   = data.get("organization", "").strip()
+    first_name = data.get("first_name", "").strip()
+    last_name  = data.get("last_name", "").strip()
+    email      = data.get("email", "").strip().lower()
+    password   = data.get("password", "")
+
+    if not org_name:
+        return jsonify({"error": "Nom d'entreprise / organisation requis"}), 400
+    if not first_name or not last_name:
+        return jsonify({"error": "Nom et prénom requis"}), 400
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"error": "Adresse e-mail invalide"}), 400
+    if len(password) < 8 or not any(c.isupper() for c in password):
+        return jsonify({"error": "Le mot de passe doit contenir au moins 8 caractères et 1 majuscule"}), 400
+    if db_users.user_exists(email):
+        return jsonify({"error": "Un compte existe déjà avec cette adresse"}), 409
+
+    org = db_users.create_organization(org_name)
+    db_users.create_user(
+        org_id=org["id"], email=email, first_name=first_name, last_name=last_name,
+        password_hash=generate_password_hash(password),
+        role="admin", google_account=False,
+    )
+    return jsonify({
+        "success": True, "email": email, "organization": org_name,
+        "agent_api_key": org["agent_api_key"],
+    }), 201
+
+
+@app.route("/api/auth/google", methods=["POST"])
+def auth_google():
+    _cleanup_expired()
+    data = request.get_json(force=True) or {}
+    credential = data.get("credential", "")
+    org_name = data.get("organization", "").strip()
+
+    try:
+        payload = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError:
+        return jsonify({"error": "Jeton Google invalide"}), 401
+
+    if not payload.get("email_verified", False):
+        return jsonify({"error": "Adresse e-mail Google non vérifiée"}), 401
+
+    email = payload["email"].lower()
+    first_name = payload.get("given_name", "")
+    last_name  = payload.get("family_name", "")
+
+    user = db_users.get_user_by_email(email)
+    new_account = user is None
+
+    if new_account:
+        if not org_name:
+            return jsonify({"error": "Nom d'organisation requis pour un premier login Google"}), 400
+        org = db_users.create_organization(org_name)
+        user = db_users.create_user(
+            org_id=org["id"], email=email, first_name=first_name, last_name=last_name,
+            password_hash=None, role="admin", google_account=True,
+        )
+
+    temp_token = _start_2fa(email, user["org_id"])
+    response = {"email": email, "temp_token": temp_token}
+    if new_account:
+        response["agent_api_key"] = db_users.get_organization(user["org_id"])["agent_api_key"]
+    return jsonify(response)
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    _cleanup_expired()
+    data = request.get_json(force=True) or {}
+    email    = data.get("username", "").strip().lower()
+    password = data.get("password", "")
+
+    user = db_users.get_user_by_email(email)
+    dummy_hash = generate_password_hash("dummy")
+    stored_hash = user["password_hash"] if (user and user["password_hash"]) else dummy_hash
+    valid = check_password_hash(stored_hash, password)
+
+    if not user or not user["password_hash"] or not valid:
+        return jsonify({"error": "Identifiants invalides"}), 401
+
+    temp_token = _start_2fa(email, user["org_id"])
+    return jsonify({"requires_2fa": True, "temp_token": temp_token})
+
+
+@app.route("/api/verify-2fa", methods=["POST"])
+def verify_2fa():
+    _cleanup_expired()
+    data = request.get_json(force=True) or {}
+    temp_token = data.get("temp_token", "")
+    code = data.get("code", "").strip()
+
+    pending = PENDING_2FA.get(temp_token)
+    if not pending:
+        return jsonify({"error": "Session expirée, recommence la connexion"}), 401
+
+    if code != pending["code"]:
+        return jsonify({"error": "Code invalide"}), 401
+
+    del PENDING_2FA[temp_token]
+    session_token = secrets.token_urlsafe(32)
+    SESSIONS[session_token] = {
+        "email": pending["email"], "org_id": pending["org_id"],
+        "expires": time.time() + SESSION_TOKEN_TTL,
+    }
+    return jsonify({"session_token": session_token})
+
+
+@app.route("/api/resend-2fa", methods=["POST"])
+def resend_2fa():
+    """Permet de renvoyer un nouveau code si l'email n'est pas arrivé."""
+    _cleanup_expired()
+    data = request.get_json(force=True) or {}
+    old_temp_token = data.get("temp_token", "")
+    pending = PENDING_2FA.get(old_temp_token)
+    if not pending:
+        return jsonify({"error": "Session expirée, recommence la connexion"}), 401
+    del PENDING_2FA[old_temp_token]
+    new_temp_token = _start_2fa(pending["email"], pending["org_id"])
+    return jsonify({"temp_token": new_temp_token})
+
+
+@app.route("/api/me", methods=["GET"])
+def me():
+    token = _extract_token()
+    session = SESSIONS.get(token)
+    if not session or session["expires"] < time.time():
+        return jsonify({"error": "Non authentifié"}), 401
+    user = db_users.get_user_by_email(session["email"])
+    org = db_users.get_organization(session["org_id"])
+    return jsonify({
+        "email": user["email"], "first_name": user["first_name"], "last_name": user["last_name"],
+        "organization": org["name"], "role": user["role"],
+    })
+
+
+@app.route("/api/organization/agent-key", methods=["GET"])
+@require_auth
+def get_agent_key():
+    org = db_users.get_organization(request.org_id)
+    return jsonify({"agent_api_key": org["agent_api_key"], "organization": org["name"]})
+
+
+@app.route("/api/organization/agent-key/regenerate", methods=["POST"])
+@require_auth
+def regenerate_agent_key():
+    new_key = db_users.regenerate_agent_key(request.org_id)
+    return jsonify({"agent_api_key": new_key})
+
+
+# ══════════════════════════════════════════════════════════
+#  INGESTION DEPUIS LES AGENTS (protégée par clé API d'organisation)
+# ══════════════════════════════════════════════════════════
+
+@app.route("/api/agents/report", methods=["POST"])
+@require_agent_key
+def agent_report():
+    data = request.get_json(force=True) or {}
+    db_data.upsert_agent(
+        org_id=request.org_id,
+        agent_id=data.get("agent_id", "inconnu"),
+        status="active",
+        cpu_percent=data.get("cpu_percent", 0),
+        ram_percent=data.get("ram_percent", 0),
+        disk_percent=data.get("disk_percent", 0),
+        os_name=data.get("os", "?"),
+        process_count=data.get("process_count", 0),
+        cpu_model=data.get("cpu_model"),
+        ram_total_gb=data.get("ram_total_gb", 0),
+        local_ip=data.get("local_ip"),
+        logged_in_user=data.get("logged_in_user"),
+        processes=data.get("processes", []),
+        public_ip=data.get("public_ip"),
+        geo_city=data.get("geo_city"),
+        geo_region=data.get("geo_region"),
+        geo_country=data.get("geo_country"),
+    )
+    return jsonify({"success": True})
+
+
+@app.route("/api/agents/alert", methods=["POST"])
+@require_agent_key
+def agent_alert():
+    data = request.get_json(force=True) or {}
+    required = ["title", "severity", "agent_id"]
+    if not all(data.get(k) for k in required):
+        return jsonify({"error": "Champs requis manquants : title, severity, agent_id"}), 400
+    if data["severity"] not in ("critical", "high", "medium", "low"):
+        return jsonify({"error": "severity doit être critical/high/medium/low"}), 400
+
+    alert_id = db_data.create_alert(
+        org_id=request.org_id,
+        title=data["title"], description=data.get("description", ""),
+        severity=data["severity"], category=data.get("category", "autre"),
+        agent_id=data["agent_id"],
+    )
+    return jsonify({"success": True, "id": alert_id}), 201
+
+
+@app.route("/api/agents/quarantine", methods=["POST"])
+@require_agent_key
+def agent_quarantine():
+    """Un agent signale qu'un fichier/processus a été bloqué (et éventuellement
+    réellement déplacé sur le disque vers un dossier de quarantaine local)."""
+    data = request.get_json(force=True) or {}
+    required = ["file_path", "agent_id", "severity", "action"]
+    if not all(data.get(k) for k in required):
+        return jsonify({"error": "Champs requis manquants : file_path, agent_id, severity, action"}), 400
+
+    item_id = db_data.create_quarantine_item(
+        org_id=request.org_id,
+        agent_id=data["agent_id"],
+        file_path=data["file_path"],
+        reason=data.get("reason", ""),
+        action=data["action"],
+        severity=data["severity"],
+        quarantine_path=data.get("quarantine_path"),
+        file_moved=data.get("file_moved", False),
+    )
+    return jsonify({"success": True, "id": item_id}), 201
+
+
+@app.route("/api/agents/process-events", methods=["POST"])
+@require_agent_key
+def agent_process_events():
+    """Un agent envoie la chaîne de processus (parent → enfant → fichier/réseau)
+    entourant une détection, pour reconstituer la Process Timeline dans le dashboard."""
+    data = request.get_json(force=True) or {}
+    alert_id = data.get("alert_id")
+    events = data.get("events", [])
+    if not alert_id or not events:
+        return jsonify({"error": "alert_id et events requis"}), 400
+
+    for ev in events:
+        db_data.create_process_event(
+            org_id=request.org_id,
+            agent_id=data.get("agent_id", ""),
+            alert_id=alert_id,
+            event_type=ev.get("event_type", "process"),
+            pid=ev.get("pid"),
+            parent_pid=ev.get("parent_pid"),
+            process_name=ev.get("process_name"),
+            parent_name=ev.get("parent_name"),
+            detail=ev.get("detail"),
+        )
+    return jsonify({"success": True, "count": len(events)}), 201
+
+
+# ══════════════════════════════════════════════════════════
+#  COMMANDES À DISTANCE — isolation réseau, kill process,
+#  quarantaine/restauration de fichier
+# ══════════════════════════════════════════════════════════
+
+@app.route("/api/agents/<agent_id>/isolate", methods=["POST"])
+@require_auth
+def isolate_agent(agent_id):
+    """Dépose une commande d'isolation réseau. L'agent, à son prochain
+    heartbeat, coupera tout le trafic sauf vers ce serveur (pare-feu local)."""
+    cmd_id = db_data.create_command(request.org_id, agent_id, "isolate")
+    return jsonify({"success": True, "command_id": cmd_id}), 201
+
+
+@app.route("/api/agents/<agent_id>/unisolate", methods=["POST"])
+@require_auth
+def unisolate_agent(agent_id):
+    cmd_id = db_data.create_command(request.org_id, agent_id, "unisolate")
+    return jsonify({"success": True, "command_id": cmd_id}), 201
+
+
+@app.route("/api/agents/<agent_id>/kill-process", methods=["POST"])
+@require_auth
+def kill_process(agent_id):
+    data = request.get_json(force=True) or {}
+    pid = data.get("pid")
+    if not pid:
+        return jsonify({"error": "pid requis"}), 400
+    cmd_id = db_data.create_command(
+        request.org_id, agent_id, "kill_process", {"pid": pid, "name": data.get("name", "")}
+    )
+    return jsonify({"success": True, "command_id": cmd_id}), 201
+
+
+@app.route("/api/agents/<agent_id>/quarantine-file", methods=["POST"])
+@require_auth
+def quarantine_file_manual(agent_id):
+    """Mise en quarantaine MANUELLE, déclenchée depuis le dashboard (pas
+    par une détection automatique de l'agent) — par PID (depuis la liste
+    des processus) ou par chemin de fichier direct."""
+    data = request.get_json(force=True) or {}
+    pid = data.get("pid")
+    path = data.get("path", "").strip()
+    if not pid and not path:
+        return jsonify({"error": "pid ou path requis"}), 400
+    cmd_id = db_data.create_command(
+        request.org_id, agent_id, "quarantine_file",
+        {
+            "pid": pid, "path": path or None,
+            "reason": data.get("reason", "Mise en quarantaine manuelle depuis le dashboard"),
+            "severity": data.get("severity", "medium"),
+        },
+    )
+    return jsonify({"success": True, "command_id": cmd_id}), 201
+
+
+@app.route("/api/quarantine/<item_id>/restore-file", methods=["POST"])
+@require_auth
+def quarantine_restore_file(item_id):
+    """Dépose une commande pour que l'agent remette RÉELLEMENT le fichier
+    à sa place d'origine (contrairement à /restore qui ne fait que changer
+    un statut administratif, pour les cas où le fichier a été déplacé)."""
+    item = db_data.get_quarantine_item(request.org_id, item_id)
+    if not item:
+        return jsonify({"error": "Élément de quarantaine introuvable"}), 404
+    if not item.get("file_moved") or not item.get("quarantine_path"):
+        return jsonify({"error": "Ce fichier n'a pas été physiquement déplacé, rien à restaurer"}), 400
+
+    cmd_id = db_data.create_command(
+        request.org_id, item["agent_id"], "restore_file",
+        {"quarantine_path": item["quarantine_path"], "original_path": item["file_path"], "item_id": item_id},
+    )
+    db_data.restore_quarantine_item(request.org_id, item_id)
+    return jsonify({"success": True, "command_id": cmd_id}), 201
+
+
+@app.route("/api/agents/commands", methods=["GET"])
+@require_agent_key
+def agent_poll_commands():
+    """L'agent appelle ceci à chaque heartbeat pour savoir si l'admin lui
+    a demandé d'intervenir sur cette machine."""
+    agent_id = request.args.get("agent_id", "")
+    if not agent_id:
+        return jsonify({"error": "agent_id requis"}), 400
+    return jsonify(db_data.get_pending_commands(request.org_id, agent_id))
+
+
+@app.route("/api/agents/commands/<command_id>/result", methods=["POST"])
+@require_agent_key
+def agent_command_result(command_id):
+    """L'agent rapporte le résultat d'une commande exécutée."""
+    data = request.get_json(force=True) or {}
+    status = data.get("status", "failed")
+    if status not in ("done", "failed"):
+        return jsonify({"error": "status doit être done/failed"}), 400
+
+    command = db_data.get_command(request.org_id, command_id)
+    db_data.complete_command(request.org_id, command_id, status, data.get("result", ""))
+
+    # Répercute isolate/unisolate sur le statut affiché de l'agent
+    if command and status == "done":
+        if command["action"] == "isolate":
+            db_data.set_agent_isolated(request.org_id, command["agent_id"], True)
+        elif command["action"] == "unisolate":
+            db_data.set_agent_isolated(request.org_id, command["agent_id"], False)
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/agents/<agent_id>/commands", methods=["GET"])
+@require_auth
+def agent_commands_history(agent_id):
+    return jsonify(db_data.get_recent_commands(request.org_id, agent_id=agent_id))
+
+
+@app.route("/api/history", methods=["GET"])
+@require_auth
+def history():
+    """Historique global (toutes machines confondues) de toutes les
+    actions/commandes exécutées ou en attente, pour l'onglet Historique."""
+    limit = int(request.args.get("limit", 100))
+    return jsonify(db_data.get_recent_commands(request.org_id, agent_id=None, limit=limit))
+
+
+# ══════════════════════════════════════════════════════════
+#  IoC — Indicateurs de Compromission (moteur de détection)
+# ══════════════════════════════════════════════════════════
+
+@app.route("/api/iocs", methods=["GET"])
+@require_auth
+def list_iocs():
+    return jsonify(db_data.get_iocs(request.org_id))
+
+
+@app.route("/api/iocs", methods=["POST"])
+@require_auth
+def add_ioc():
+    data = request.get_json(force=True) or {}
+    ioc_type = data.get("type")
+    value = data.get("value", "").strip()
+    if ioc_type not in ("hash", "ip", "cmdline_pattern") or not value:
+        return jsonify({"error": "type (hash/ip/cmdline_pattern) et value requis"}), 400
+    ioc_id = db_data.create_ioc(
+        request.org_id, ioc_type, value,
+        severity=data.get("severity", "high"), description=data.get("description", ""),
+    )
+    return jsonify({"success": True, "id": ioc_id}), 201
+
+
+@app.route("/api/iocs/<ioc_id>", methods=["DELETE"])
+@require_auth
+def remove_ioc(ioc_id):
+    db_data.delete_ioc(request.org_id, ioc_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/agents/iocs", methods=["GET"])
+@require_agent_key
+def agent_get_iocs():
+    """L'agent récupère périodiquement la liste des IoC de son organisation
+    pour son moteur de détection local (hash, IP, motifs de ligne de commande)."""
+    return jsonify(db_data.get_iocs(request.org_id))
+
+
+# ══════════════════════════════════════════════════════════
+#  DONNÉES EDR (protégées, toujours scopées à request.org_id)
+# ══════════════════════════════════════════════════════════
+
+@app.route("/api/stats", methods=["GET"])
+@require_auth
+def stats():
+    return jsonify(db_data.get_stats(request.org_id))
+
+
+@app.route("/api/alerts", methods=["GET"])
+@require_auth
+def alerts():
+    severity = request.args.get("severity")
+    limit = int(request.args.get("limit", 50))
+    return jsonify(db_data.get_alerts(request.org_id, severity=severity, limit=limit))
+
+
+@app.route("/api/alerts/<alert_id>/ack", methods=["POST"])
+@require_auth
+def ack(alert_id):
+    db_data.ack_alert(request.org_id, alert_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/alerts/<alert_id>/process-tree", methods=["GET"])
+@require_auth
+def alert_process_tree(alert_id):
+    return jsonify(db_data.get_process_tree(request.org_id, alert_id))
+
+
+@app.route("/api/investigate/aggregations", methods=["GET"])
+@require_auth
+def investigate_aggregations():
+    return jsonify(db_data.get_investigate_aggregations(request.org_id))
+
+
+@app.route("/api/quarantine", methods=["GET"])
+@require_auth
+def quarantine():
+    return jsonify(db_data.get_quarantine(request.org_id))
+
+
+@app.route("/api/quarantine/<item_id>/restore", methods=["POST"])
+@require_auth
+def quarantine_restore(item_id):
+    db_data.restore_quarantine_item(request.org_id, item_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/agents", methods=["GET"])
+@require_auth
+def agents():
+    return jsonify(db_data.get_agents(request.org_id))
+
+
+@app.route("/api/demo/seed", methods=["POST"])
+@require_auth
+def demo_seed():
+    db_data.seed_demo(request.org_id)
+    return jsonify({"success": True})
+
+
+@app.route("/api/demo/clear", methods=["POST"])
+@require_auth
+def demo_clear():
+    """Efface uniquement les données de démo de cette organisation ;
+    les vraies données remontées par de vrais agents ne sont jamais touchées."""
+    db_data.clear_demo_data(request.org_id)
+    return jsonify({"success": True})
+
+
+if __name__ == "__main__":
+    # host="0.0.0.0" : écoute sur toutes les interfaces réseau, pas
+    # seulement 127.0.0.1 — nécessaire pour être accessible depuis
+    # d'autres appareils (réseau local, ou via un tunnel type ngrok).
+    #
+    # ⚠️ debug=False volontairement : le débogueur Werkzeug (debug=True)
+    # permet d'exécuter du code arbitraire sur le serveur si quelqu'un y
+    # accède pendant une erreur. À n'activer qu'en développement local,
+    # JAMAIS si le serveur est exposé au-delà de votre propre machine.
+    app.run(host="0.0.0.0", port=5000, debug=False)
