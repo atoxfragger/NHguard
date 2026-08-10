@@ -1,0 +1,27 @@
+@echo off
+REM ──────────────────────────────────────────────────────────
+REM build_agent.bat — compile edr_agent.py en un .exe unique
+REM à distribuer à vos clients (ils ne verront ni le code
+REM source, ni la clé API de qui que ce soit).
+REM
+REM Usage : double-cliquez sur ce fichier (ou lancez-le depuis
+REM cmd), dans le même dossier que edr_agent.py.
+REM ──────────────────────────────────────────────────────────
+
+echo Installation de PyInstaller et des dependances...
+pip install pyinstaller requests psutil
+
+echo.
+echo Compilation en cours...
+pyinstaller --onefile --windowed --name EDRAgent edr_agent.py
+
+echo.
+echo ────────────────────────────────────────────────
+echo Termine ! Le fichier distribuable se trouve dans :
+echo   dist\EDRAgent.exe
+echo.
+echo C'est CE fichier .exe que vous donnez a vos clients.
+echo Ne partagez jamais edr_agent.py (le code source) ni le
+echo dossier "build".
+echo ────────────────────────────────────────────────
+pause
