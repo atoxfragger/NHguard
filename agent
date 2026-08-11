@@ -109,6 +109,15 @@ BUILTIN_CMDLINE_PATTERNS = [
 OFFICE_APPS = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "mspub.exe"}
 SCRIPT_INTERPRETERS = {"powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe", "mshta.exe"}
 
+# Processus système Windows courants et légitimes — le Risk Engine réduit
+# le score quand le processus détecté en fait partie (réduit le bruit sur
+# les faux positifs touchant des binaires système bien connus).
+KNOWN_GOOD_PROCESSES = {
+    "explorer.exe", "svchost.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+    "services.exe", "lsass.exe", "dwm.exe", "taskhostw.exe", "spoolsv.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "SearchIndexer.exe", "audiodg.exe",
+}
+
 _already_alerted = set()
 _hash_cache = {}   # chemin de fichier -> hash SHA-256 (évite de re-hasher à chaque cycle)
 _iocs_cache = {"hash": {}, "ip": {}, "cmdline_pattern": []}
@@ -321,17 +330,20 @@ def send_heartbeat(cfg, stats):
         print(f"[!] Serveur injoignable : {e}")
 
 
-def send_alert(cfg, title, description, severity, category):
+def send_alert(cfg, title, description, severity, category, signals=None):
     headers = {"Content-Type": "application/json", "X-Agent-Key": cfg["api_key"]}
     payload = {
         "title": title, "description": description,
         "severity": severity, "category": category, "agent_id": cfg["agent_id"],
+        "signals": signals or {},
     }
     try:
         r = requests.post(f"{cfg['server_url']}/api/agents/alert", json=payload, headers=headers, timeout=5)
         if r.status_code == 201:
-            print(f"[ALERTE ENVOYÉE] {title}")
-            return r.json().get("id")
+            resp = r.json()
+            computed = f" (Risk Engine: score={resp.get('score')}, sévérité={resp.get('severity')})" if resp.get('score') is not None else ""
+            print(f"[ALERTE ENVOYÉE] {title}{computed}")
+            return resp.get("id")
         print(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
         print(f"[!] Serveur injoignable : {e}")
@@ -609,6 +621,40 @@ def build_process_ancestry(proc, max_levels=4):
     return events
 
 
+def is_ms_system_path(file_path):
+    """Le fichier se trouve-t-il dans un dossier système Windows courant ?
+    Heuristique simple (pas une vraie vérification de signature Authenticode,
+    qui demanderait une bibliothèque supplémentaire) — sert de proxy
+    raisonnable pour le signal 'file_ms_signed_path' du Risk Engine."""
+    if not file_path:
+        return False
+    p = file_path.lower().replace("/", "\\")
+    return "\\windows\\system32\\" in p or "\\windows\\syswow64\\" in p
+
+
+def is_persistence_path(file_path):
+    """Le fichier a-t-il été déposé dans un emplacement de démarrage
+    automatique classique (dossier Startup) ?"""
+    if not file_path:
+        return False
+    p = file_path.lower().replace("/", "\\")
+    return "\\startup\\" in p or "\\start menu\\programs\\startup" in p
+
+
+def is_admin_or_system_user(username):
+    if not username:
+        return False
+    u = username.lower()
+    return u in ("system", "administrator", "administrateur") or "admin" in u
+
+
+def is_server_asset(agent_id):
+    """Heuristique simple : les machines nommées avec un préfixe serveur
+    (SRV-..., convention utilisée dans nos données de démo) sont
+    considérées comme des actifs plus sensibles."""
+    return bool(agent_id) and ("srv" in agent_id.lower() or "server" in agent_id.lower())
+
+
 def hash_file(path, chunk_size=65536):
     if path in _hash_cache:
         return _hash_cache[path]
@@ -639,15 +685,20 @@ def quarantine_file(file_path):
         return None, False
 
 
-def handle_detection(cfg, proc, title, description, severity, category, reason):
+def handle_detection(cfg, proc, title, description, severity, category, reason, extra_signals=None):
     """Point d'entrée unique pour toute détection, quelle que soit la règle
     qui l'a déclenchée (nom connu, hash, motif de commande, LOLBin...).
     Capture l'ascendance AVANT d'agir, arrête le processus, met le fichier
-    en quarantaine pour de vrai, puis remonte tout au serveur."""
+    en quarantaine pour de vrai, construit les signaux du Risk Engine, puis
+    remonte tout au serveur (qui calcule le score et la sévérité finale)."""
     try:
         file_path = proc.exe()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         file_path = None
+    try:
+        proc_name = proc.name().lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        proc_name = ""
 
     ancestry_events = build_process_ancestry(proc)
     ancestry_events.append({
@@ -669,7 +720,22 @@ def handle_detection(cfg, proc, title, description, severity, category, reason):
 
     action = "process_terminated" if process_stopped else "detected_only"
 
-    alert_id = send_alert(cfg, title, f"{description} — {reason}", severity, category)
+    # Construction des signaux factuels pour le Risk Engine du serveur —
+    # l'agent ne décide plus lui-même de la sévérité, il décrit juste ce
+    # qu'il a observé.
+    signals = {
+        "process_suspect": proc_name not in KNOWN_GOOD_PROCESSES,
+        "known_good_name": proc_name in KNOWN_GOOD_PROCESSES,
+        "file_unknown": True,  # ce point de code n'est atteint que sur détection -> fichier non catalogué comme sain
+        "ms_system_path": is_ms_system_path(file_path),
+        "persistence_path": is_persistence_path(file_path),
+        "admin_or_system_user": is_admin_or_system_user(get_logged_in_user()),
+        "server_asset": is_server_asset(cfg.get("agent_id")),
+    }
+    if extra_signals:
+        signals.update(extra_signals)
+
+    alert_id = send_alert(cfg, title, f"{description} — {reason}", severity, category, signals=signals)
     send_quarantine(cfg, file_path or "(chemin inconnu)", reason, action, severity,
                      quarantine_path=quarantine_path, file_moved=file_moved)
     send_process_events(cfg, alert_id, ancestry_events)
@@ -694,7 +760,8 @@ def scan_processes(cfg):
         if name in SUSPICIOUS_PROCESS_NAMES:
             severity, category, description = SUSPICIOUS_PROCESS_NAMES[name]
             handle_detection(cfg, proc, f"Processus suspect détecté : {name}",
-                              description, severity, category, "Nom de processus connu comme malveillant")
+                              description, severity, category, "Nom de processus connu comme malveillant",
+                              extra_signals={"known_bad_name": True})
             _already_alerted.add(detection_key)
             continue
 
@@ -710,7 +777,8 @@ def scan_processes(cfg):
                 handle_detection(cfg, proc, f"Hash malveillant connu : {name}",
                                   ioc.get("description", "Correspond à un IoC de type hash"),
                                   ioc.get("severity", "high"), "malware",
-                                  f"SHA-256 {digest[:16]}… présent dans la base d'IoC")
+                                  f"SHA-256 {digest[:16]}… présent dans la base d'IoC",
+                                  extra_signals={"ioc_hash_match": True})
                 _already_alerted.add(detection_key)
                 continue
 
@@ -721,9 +789,11 @@ def scan_processes(cfg):
             cmdline = ""
         if cmdline:
             matched = None
+            matched_via_ioc = False
             for pattern, ioc in _iocs_cache["cmdline_pattern"]:
                 if pattern.search(cmdline):
                     matched = (ioc.get("severity", "high"), "malware", ioc.get("description", "Motif IoC"))
+                    matched_via_ioc = True
                     break
             if not matched:
                 for pattern, sev, cat, desc in BUILTIN_CMDLINE_PATTERNS:
@@ -732,8 +802,10 @@ def scan_processes(cfg):
                         break
             if matched:
                 severity, category, description = matched
+                signal_key = "ioc_cmdline_match" if matched_via_ioc else "builtin_cmdline_match"
                 handle_detection(cfg, proc, f"Ligne de commande suspecte : {name}",
-                                  description, severity, category, "Motif détecté dans la ligne de commande")
+                                  description, severity, category, "Motif détecté dans la ligne de commande",
+                                  extra_signals={signal_key: True})
                 _already_alerted.add(detection_key)
                 continue
 
@@ -749,7 +821,8 @@ def scan_processes(cfg):
                                   "Une application bureautique a lancé un interpréteur de script — "
                                   "signature classique de macro malveillante",
                                   "high", "defense_evasion",
-                                  f"{parent_name} a créé le processus {name}")
+                                  f"{parent_name} a créé le processus {name}",
+                                  extra_signals={"lolbin_parent_child": True})
                 _already_alerted.add(detection_key)
                 continue
 
@@ -762,7 +835,8 @@ def scan_processes(cfg):
                         handle_detection(cfg, proc, f"Connexion vers une IP malveillante connue : {name}",
                                           ioc.get("description", "Adresse IP présente dans la base d'IoC"),
                                           ioc.get("severity", "high"), "network",
-                                          f"Connexion sortante vers {conn.raddr.ip}:{conn.raddr.port}")
+                                          f"Connexion sortante vers {conn.raddr.ip}:{conn.raddr.port}",
+                                          extra_signals={"ioc_ip_match": True})
                         _already_alerted.add(detection_key)
                         break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
