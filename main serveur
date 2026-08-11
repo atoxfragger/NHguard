@@ -1,4 +1,24 @@
+"""
+edr_server.py — Serveur EDR multi-tenant (SaaS).
 
+Double authentification : au lieu d'une application d'authentification
+(TOTP/QR code), un code à 6 chiffres est généré côté serveur et envoyé
+par EMAIL à l'utilisateur à chaque connexion. Il expire après 5 minutes.
+
+Chaque organisation (entreprise cliente) est isolée :
+  - Ses propres utilisateurs (org_id dans edr_users.db)
+  - Sa propre clé API agent, générée automatiquement à l'inscription
+  - Ses propres agents et alertes (org_id dans edr_data.db)
+
+Installation :
+    pip install flask flask-cors werkzeug google-auth
+
+Configuration de l'envoi d'email : voir la section SMTP ci-dessous
+avant de lancer le serveur.
+
+Lancement :
+    python edr_server.py
+"""
 
 import os
 import random
@@ -16,6 +36,7 @@ from google.auth.transport import requests as google_requests
 
 import db_users
 import db_data
+import risk_engine
 
 app = Flask(__name__)
 CORS(app)
@@ -23,6 +44,14 @@ CORS(app)
 db_users.init_db()
 db_data.init_db()
 
+# ──────────────────────────────────────────────────────────
+# Sert les pages HTML directement depuis Flask : un seul serveur,
+# un seul port à exposer (plus besoin de "python -m http.server" en
+# parallèle, ni de gérer 2 tunnels séparés si vous utilisez ngrok/
+# Cloudflare Tunnel pour un accès distant).
+# Whitelist stricte : seuls des fichiers .html du dossier courant sont
+# servables, jamais les .py/.db/.bat (pas de traversée de dossier).
+# ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -40,13 +69,26 @@ def static_html(filename):
         abort(404)
     return send_from_directory(BASE_DIR, filename)
 
+
+# ⚠️ Même Client ID que celui utilisé côté frontend.
 GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleusercontent.com"
 
+# ──────────────────────────────────────────────────────────
+# Configuration SMTP — à renseigner avant de lancer le serveur.
+# Exemple avec Gmail : activez la validation en 2 étapes sur le compte
+# Gmail expéditeur, puis créez un "mot de passe d'application" sur
+# https://myaccount.google.com/apppasswords (le mot de passe normal du
+# compte ne fonctionnera pas avec le SMTP).
+# ⚠️ Ce mot de passe d'application peut être révoqué par Google sans
+# prévenir (changement de mot de passe principal, activité jugée
+# suspecte...). Si l'envoi recommence à échouer avec une erreur 535,
+# retournez sur la page apppasswords et régénérez-en un nouveau.
+# ──────────────────────────────────────────────────────────
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "..."
+SMTP_USER = '...'
 SMTP_PASSWORD = "..."
-SMTP_FROM_NAME = "NHguard"
+SMTP_FROM_NAME = "NHGuard"
 
 
 def send_verification_email(to_email: str, code: str):
@@ -125,6 +167,10 @@ def require_agent_key(f):
     return wrapper
 
 
+# ══════════════════════════════════════════════════════════
+#  INSCRIPTION / ORGANISATION
+# ══════════════════════════════════════════════════════════
+
 @app.route("/api/register", methods=["POST"])
 def register():
     data = request.get_json(force=True) or {}
@@ -196,6 +242,10 @@ def auth_google():
         response["agent_api_key"] = db_users.get_organization(user["org_id"])["agent_api_key"]
     return jsonify(response)
 
+
+# ══════════════════════════════════════════════════════════
+#  CONNEXION / 2FA PAR EMAIL
+# ══════════════════════════════════════════════════════════
 
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -321,13 +371,23 @@ def agent_alert():
     if data["severity"] not in ("critical", "high", "medium", "low"):
         return jsonify({"error": "severity doit être critical/high/medium/low"}), 400
 
+    signals = data.get("signals")
+    if signals:
+        # Source de vérité : le Risk Engine calcule score ET sévérité à
+        # partir des signaux factuels envoyés par l'agent — la "severity"
+        # suggérée par l'agent (ci-dessus) n'est qu'un repli si jamais
+        # aucun signal n'est fourni (ancien agent, appel de test, etc.).
+        score, breakdown, severity = risk_engine.compute_risk(signals)
+    else:
+        score, breakdown, severity = None, None, data["severity"]
+
     alert_id = db_data.create_alert(
         org_id=request.org_id,
         title=data["title"], description=data.get("description", ""),
-        severity=data["severity"], category=data.get("category", "autre"),
-        agent_id=data["agent_id"],
+        severity=severity, category=data.get("category", "autre"),
+        agent_id=data["agent_id"], score=score, score_breakdown=breakdown,
     )
-    return jsonify({"success": True, "id": alert_id}), 201
+    return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
 
 
 @app.route("/api/agents/quarantine", methods=["POST"])
