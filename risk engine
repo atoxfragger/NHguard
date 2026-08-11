@@ -1,0 +1,166 @@
+"""
+risk_engine.py — Moteur de scoring des alertes NHGuard.
+
+Calcule un score de risque (0-100) à partir de signaux factuels envoyés
+par l'agent (processus connu/inconnu, IoC confirmé, parent suspect,
+persistance, etc.), plutôt que de laisser l'agent décider lui-même
+d'une sévérité arbitraire. Cette centralisation permet de :
+
+  - garder UNE seule source de vérité pour les poids/règles (modifiable
+    ici sans jamais toucher au code de l'agent ni le redéployer)
+  - expliquer précisément CHAQUE score ("pourquoi cette alerte vaut 82 ?")
+  - faire évoluer la logique de scoring dans le temps sans casser la
+    compatibilité avec les agents déjà déployés
+
+Le module est volontairement dépourvu de dépendances externes.
+"""
+
+# ──────────────────────────────────────────────────────────
+# Poids par signal, organisés par famille (catégorie du Risk Engine)
+# ──────────────────────────────────────────────────────────
+WEIGHTS = {
+    "process_suspect":     20,   # nom de processus inconnu / non répertorié comme sain
+    "process_known_good":  -20,  # processus reconnu comme légitime (réduit le bruit)
+    "cmdline_suspect":     20,   # motif suspect dans la ligne de commande (IoC ou intégré)
+    "parent_suspect":      25,   # relation parent/enfant anormale (LOLBin, etc.)
+    "file_unknown":        10,   # fichier non répertorié / non catégorisé
+    "file_ms_signed_path": -30,  # chemin sous un dossier système Windows connu
+    "network_suspect":     20,   # connexion vers une IP figurant dans les IoC
+    "persistence":         30,   # dépôt dans un emplacement de démarrage automatique
+    "identity_privileged": 10,   # exécuté par un compte administrateur/système
+    "ioc_confirmed":       40,   # correspondance directe avec un IoC (hash, nom connu)
+    "reputation_low":      10,   # fichier inconnu, non signé, hors dossier système
+    "environment_critical": 10,  # machine considérée comme un actif sensible (serveur...)
+    "correlation_bonus":   15,   # plusieurs familles de signaux déclenchées simultanément
+}
+
+CATEGORY_LABELS = {
+    "process":      "Processus",
+    "command_line": "Ligne de commande",
+    "parent_child":  "Parent / Enfant",
+    "file":         "Fichier",
+    "network":      "Réseau",
+    "persistence":  "Persistance",
+    "identity":     "Identité",
+    "ioc":          "IOC",
+    "reputation":   "Réputation",
+    "environment":  "Environnement",
+    "correlation":  "Corrélation",
+}
+
+# Seuils de sévérité à partir du score final (0-100)
+THRESHOLDS = [
+    (80, "critical"),
+    (60, "high"),
+    (30, "medium"),
+    (0,  "low"),
+]
+
+
+def compute_risk(signals: dict):
+    """Calcule le score de risque à partir d'un dict de signaux booléens.
+
+    Signaux attendus (tous optionnels, absent = False) :
+      process_suspect, known_good_name, ioc_hash_match, ioc_ip_match,
+      ioc_cmdline_match, builtin_cmdline_match, lolbin_parent_child,
+      unusual_parent, file_unknown, ms_system_path, persistence_path,
+      admin_or_system_user, server_asset, known_bad_name
+
+    Retourne (score:int, breakdown:dict[label -> points], severity:str).
+    breakdown ne contient que les familles ayant contribué au score
+    (positivement ou négativement) — c'est ce qui s'affiche dans le
+    panneau "Pourquoi cette alerte vaut X ?" du dashboard.
+
+    Important : chaque famille répond à un signal d'entrée distinct.
+    Le bonus de corrélation compte le nombre de signaux d'ENTRÉE
+    indépendants déclenchés (pas le nombre de familles de score
+    obtenues en sortie) — sinon un seul fait (ex: fichier inconnu, qui
+    alimente à la fois "Fichier" et "Réputation") gonflerait
+    artificiellement la corrélation alors qu'une seule observation
+    réelle est en jeu.
+    """
+    s = signals or {}
+    raw = {}
+
+    # Process : signal dédié (pas dérivé de file_unknown, pour éviter
+    # qu'une seule observation ne compte double).
+    if s.get("known_good_name"):
+        raw["process"] = WEIGHTS["process_known_good"]
+    elif s.get("process_suspect"):
+        raw["process"] = WEIGHTS["process_suspect"]
+    else:
+        raw["process"] = 0
+
+    # Command line
+    raw["command_line"] = WEIGHTS["cmdline_suspect"] if (
+        s.get("ioc_cmdline_match") or s.get("builtin_cmdline_match")
+    ) else 0
+
+    # Parent / Enfant
+    raw["parent_child"] = WEIGHTS["parent_suspect"] if (
+        s.get("lolbin_parent_child") or s.get("unusual_parent")
+    ) else 0
+
+    # Fichier
+    file_score = 0
+    if s.get("file_unknown"):
+        file_score += WEIGHTS["file_unknown"]
+    if s.get("ms_system_path"):
+        file_score += WEIGHTS["file_ms_signed_path"]
+    raw["file"] = file_score
+
+    # Réseau
+    raw["network"] = WEIGHTS["network_suspect"] if s.get("ioc_ip_match") else 0
+
+    # Persistance
+    raw["persistence"] = WEIGHTS["persistence"] if s.get("persistence_path") else 0
+
+    # Identité
+    raw["identity"] = WEIGHTS["identity_privileged"] if s.get("admin_or_system_user") else 0
+
+    # IOC
+    raw["ioc"] = WEIGHTS["ioc_confirmed"] if (
+        s.get("ioc_hash_match") or s.get("known_bad_name")
+    ) else 0
+
+    # Réputation (dérivée de file_unknown — même observation que "Fichier",
+    # donc volontairement EXCLUE du décompte de corrélation ci-dessous)
+    raw["reputation"] = WEIGHTS["reputation_low"] if (
+        s.get("file_unknown") and not s.get("ms_system_path") and not s.get("known_good_name")
+    ) else 0
+
+    # Environnement
+    raw["environment"] = WEIGHTS["environment_critical"] if s.get("server_asset") else 0
+
+    # Corrélation : compte les signaux d'ENTRÉE indépendants (pas les
+    # familles de score en sortie), pour ne récompenser qu'une vraie
+    # convergence de plusieurs observations distinctes.
+    primary_signals = [
+        bool(s.get("process_suspect")),
+        bool(s.get("ioc_cmdline_match") or s.get("builtin_cmdline_match")),
+        bool(s.get("lolbin_parent_child") or s.get("unusual_parent")),
+        bool(s.get("file_unknown")),
+        bool(s.get("ioc_ip_match")),
+        bool(s.get("persistence_path")),
+        bool(s.get("admin_or_system_user")),
+        bool(s.get("ioc_hash_match") or s.get("known_bad_name")),
+        bool(s.get("server_asset")),
+    ]
+    active_count = sum(1 for f in primary_signals if f)
+    raw["correlation"] = WEIGHTS["correlation_bonus"] if active_count >= 3 else 0
+
+    total = max(0, min(100, sum(raw.values())))
+
+    severity = "low"
+    for threshold, label in THRESHOLDS:
+        if total >= threshold:
+            severity = label
+            break
+
+    breakdown = {
+        CATEGORY_LABELS[cat]: pts
+        for cat, pts in raw.items()
+        if pts != 0
+    }
+
+    return total, breakdown, severity
