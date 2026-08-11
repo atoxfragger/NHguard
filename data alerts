@@ -15,6 +15,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+import risk_engine
+
 DB_PATH = "edr_data.db"
 
 
@@ -67,6 +69,7 @@ def init_db():
                 description    TEXT,
                 severity       TEXT NOT NULL,
                 score          INTEGER NOT NULL DEFAULT 0,
+                score_breakdown TEXT,   -- JSON: détail du calcul par famille (Risk Engine)
                 category       TEXT,
                 agent_id       TEXT,
                 timestamp      TEXT NOT NULL,
@@ -164,11 +167,15 @@ def init_db():
         if "score" not in alert_cols:
             conn.execute("ALTER TABLE alerts ADD COLUMN score INTEGER NOT NULL DEFAULT 0")
             # Rétro-calcule un score pour les alertes déjà existantes
-            for sev, sc in [("critical", 9), ("high", 6), ("medium", 4), ("low", 2)]:
+            for sev, sc in [("critical", 90), ("high", 70), ("medium", 45), ("low", 15)]:
                 conn.execute("UPDATE alerts SET score = ? WHERE severity = ? AND score = 0", (sc, sev))
+        if "score_breakdown" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN score_breakdown TEXT")
 
 
-SEVERITY_SCORE = {"critical": 9, "high": 6, "medium": 4, "low": 2}
+# Score de repli si le Risk Engine n'a pas pu être appliqué (ex: alerte créée
+# sans signaux détaillés) — échelle alignée sur le moteur (0-100).
+SEVERITY_SCORE = {"critical": 90, "high": 70, "medium": 45, "low": 15}
 
 
 # ──────────────────────────────────────────────────────────
@@ -242,19 +249,29 @@ def get_alerts(org_id, severity=None, limit=50):
                 "SELECT * FROM alerts WHERE org_id = ? ORDER BY timestamp DESC LIMIT ?",
                 (org_id, limit),
             ).fetchall()
-        return [dict(r) for r in rows]
+        alerts = []
+        for r in rows:
+            a = dict(r)
+            try:
+                a["score_breakdown"] = json.loads(a["score_breakdown"]) if a.get("score_breakdown") else {}
+            except (TypeError, json.JSONDecodeError):
+                a["score_breakdown"] = {}
+            alerts.append(a)
+        return alerts
 
 
-def create_alert(org_id, title, description, severity, category, agent_id, is_demo=False, score=None):
+def create_alert(org_id, title, description, severity, category, agent_id, is_demo=False,
+                  score=None, score_breakdown=None):
     alert_id = str(uuid.uuid4())
     if score is None:
         score = SEVERITY_SCORE.get(severity, 1)
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO alerts (id, org_id, title, description, severity, score, category, agent_id, timestamp, acknowledged, is_demo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-        """, (alert_id, org_id, title, description, severity, score, category, agent_id,
-              datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0))
+            INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, category, agent_id, timestamp, acknowledged, is_demo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (alert_id, org_id, title, description, severity, score,
+              json.dumps(score_breakdown) if score_breakdown else None,
+              category, agent_id, datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0))
     return alert_id
 
 
@@ -622,18 +639,33 @@ def seed_demo(org_id):
 
     active_agents = [a for a, s, _ in DEMO_AGENTS if s == "active"]
     now = datetime.utcnow()
-    demo_alerts_info = []  # (alert_id, severity, agent_id, category)
+    demo_alerts_info = []  # (alert_id, severity_calculée, agent_id, category)
+
+    # Signaux représentatifs par bande de sévérité visée, validés pour
+    # retomber dans le bon seuil du Risk Engine (voir risk_engine.THRESHOLDS).
+    DEMO_SIGNALS_BY_SEVERITY = {
+        "critical": {"process_suspect": True, "ioc_hash_match": True, "lolbin_parent_child": True,
+                     "ioc_ip_match": True, "ioc_cmdline_match": True, "file_unknown": True},
+        "high":     {"process_suspect": True, "ioc_cmdline_match": True, "admin_or_system_user": True},
+        "medium":   {"process_suspect": True, "ioc_cmdline_match": True},
+        "low":      {"file_unknown": True},
+    }
+
     with get_connection() as conn:
-        for title, desc, sev, cat in DEMO_ALERTS:
+        for title, desc, target_sev, cat in DEMO_ALERTS:
             alert_id = str(uuid.uuid4())
             chosen_agent = random.choice(active_agents)
-            demo_alerts_info.append((alert_id, sev, chosen_agent, cat))
             ts = (now - timedelta(minutes=random.randint(1, 2000))).isoformat(timespec="seconds")
             acknowledged = 1 if random.random() < 0.25 else 0
+            # La sévérité stockée est TOUJOURS celle calculée par le moteur
+            # à partir des signaux — jamais choisie à la main, exactement
+            # comme pour une vraie détection remontée par un agent.
+            score, breakdown, computed_sev = risk_engine.compute_risk(DEMO_SIGNALS_BY_SEVERITY.get(target_sev, {}))
+            demo_alerts_info.append((alert_id, computed_sev, chosen_agent, cat))
             conn.execute("""
-                INSERT INTO alerts (id, org_id, title, description, severity, score, category, agent_id, timestamp, acknowledged, is_demo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """, (alert_id, org_id, title, desc, sev, SEVERITY_SCORE.get(sev, 1), cat,
+                INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, category, agent_id, timestamp, acknowledged, is_demo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (alert_id, org_id, title, desc, computed_sev, score, json.dumps(breakdown), cat,
                   chosen_agent, ts, acknowledged))
 
     # Arbre d'exécution de démo, rattaché à TOUTES les alertes critiques/hautes
