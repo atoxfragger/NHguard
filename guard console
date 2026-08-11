@@ -36,7 +36,53 @@
     --font-mono: 'JetBrains Mono', monospace;
     --font-ui:   'Inter', sans-serif;
     --font-display: 'Space Grotesk', sans-serif;
+    --scene-glow: #f4f7f9;
+    --card-bg:    rgba(255,255,255,.9);
+    --card-shadow: rgba(15,23,42,.18);
   }
+
+  /* ── Mode sombre — mêmes variables, valeurs inversées ────── */
+  [data-theme="dark"] {
+    --void:      #05070a;
+    --panel:     #0b1119;
+    --grid-line: #16222c;
+    --bg0:      #0a0c0f;
+    --bg1:      #10141a;
+    --bg2:      #161b24;
+    --bg3:      #1e2530;
+    --bg4:      #252e3d;
+    --border:   #2a3444;
+    --text1:    #e2e8f0;
+    --text2:    #94a3b8;
+    --text3:    #64748b;
+    --red:      #f87171;
+    --orange:   #fb923c;
+    --yellow:   #fbbf24;
+    --green:    #4ade80;
+    --blue:     #60a5fa;
+    --purple:   #a78bfa;
+    --teal:     #2dd4bf;
+    --red-bg:   rgba(248,113,113,.12);
+    --ora-bg:   rgba(251,146,60,.12);
+    --yel-bg:   rgba(251,191,36,.12);
+    --grn-bg:   rgba(74,222,128,.12);
+    --scene-glow: #0c1620;
+    --card-bg:    rgba(11,17,25,.94);
+    --card-shadow: rgba(0,0,0,.7);
+  }
+
+  /* Bouton de bascule clair/sombre, dans la topbar */
+  .theme-toggle {
+    width: 30px; height: 30px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--bg2); color: var(--text2); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .15s, color .15s;
+  }
+  .theme-toggle:hover { background: var(--bg3); color: var(--text1); }
+  .theme-toggle svg { width: 15px; height: 15px; }
+  .theme-toggle .icon-moon { display: none; }
+  [data-theme="dark"] .theme-toggle .icon-sun  { display: none; }
+  [data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 
   html, body { height: 100%; background: var(--bg0); color: var(--text1); font-family: var(--font-ui); }
 
@@ -306,7 +352,7 @@
 
   .scene {
     position: fixed; inset: 0; z-index: 0; overflow: hidden;
-    background: radial-gradient(ellipse 80% 55% at 50% 28%, #f4f7f9 0%, var(--void) 68%);
+    background: radial-gradient(ellipse 80% 55% at 50% 28%, var(--scene-glow) 0%, var(--void) 68%);
   }
   .horizon {
     position: absolute; left: 0; right: 0; top: 30%; height: 1px;
@@ -366,11 +412,11 @@
 
   .login-card {
     position: relative;
-    background: rgba(255,255,255,.9);
+    background: var(--card-bg);
     backdrop-filter: blur(6px);
     border: 1px solid var(--border);
     border-radius: 14px; padding: 30px 26px;
-    box-shadow: 0 30px 60px -20px rgba(15,23,42,.18), 0 0 0 1px rgba(13,148,136,.04);
+    box-shadow: 0 30px 60px -20px var(--card-shadow), 0 0 0 1px rgba(13,148,136,.04);
   }
   .login-card::before, .login-card::after, .login-corner-bl, .login-corner-br {
     content: ''; position: absolute; width: 16px; height: 16px;
@@ -566,7 +612,11 @@
         <div class="topbar-title" id="page-title">Dashboard</div>
         <div class="topbar-sub" id="page-sub">Dernière actualisation : —</div>
       </div>
-      <div class="status-dot" id="status-dot"></div>
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Changer de thème" style="margin-left:auto">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <div class="status-dot" id="status-dot" style="margin-left:14px"></div>
       <div class="status-text" id="status-text">Connexion…</div>
     </div>
 
@@ -593,6 +643,27 @@ const API = window.location.origin;
 let currentPage = 'dashboard';
 let currentFilter = 'all';
 let refreshTimer;
+
+// ── Mode clair / sombre ───────────────────────────────────
+// localStorage est approprié ici : ce fichier tourne comme une vraie page
+// web sur votre propre serveur, pas dans un aperçu d'artefact Claude.ai.
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+}
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  const next = current === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  try { localStorage.setItem('nhguard-theme', next); } catch {}
+}
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('nhguard-theme'); } catch {}
+  if (!saved) {
+    saved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  applyTheme(saved);
+})();
 
 // ── Inclinaison 3D du panneau de connexion au mouvement de la souris ──
 (function () {
@@ -1220,6 +1291,8 @@ async function populateAlertDetailContent(alertId) {
 
   const alert = _alertsIndex[alertId];
   const agent = alert ? await getAgentInfo(alert.agent_id) : null;
+  const breakdown = alert?.score_breakdown || {};
+  const hasBreakdown = Object.keys(breakdown).length > 0;
 
   const rows = [
     ['Composant', 'NHGuard'],
@@ -1241,7 +1314,27 @@ async function populateAlertDetailContent(alertId) {
     );
   }
 
+  const breakdownHtml = hasBreakdown ? `
+    <div style="margin-bottom:14px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px 14px">
+      <div style="font-size:11px;color:var(--text2);font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px">
+        Pourquoi cette alerte vaut ${alert.score} ?
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px">
+        ${Object.entries(breakdown).map(([label, pts]) => `
+          <tr>
+            <td style="padding:2px 0;color:var(--text2)">${label}</td>
+            <td style="padding:2px 0;text-align:right;color:${pts>0?'var(--red)':'var(--green)'}">${pts>0?'+':''}${pts}</td>
+          </tr>`).join('')}
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:4px 0;color:var(--text1);font-weight:600">Total</td>
+          <td style="padding:4px 0;text-align:right;color:var(--text1);font-weight:600">${alert.score}</td>
+        </tr>
+      </table>
+    </div>
+  ` : '';
+
   content.innerHTML = `
+    ${breakdownHtml}
     <table style="width:100%;border-collapse:collapse">
       ${rows.map(([label, value]) => `
         <tr>
