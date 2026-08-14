@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import risk_engine
+import process_scoring
 
 DB_PATH = "edr_data.db"
 
@@ -70,6 +71,7 @@ def init_db():
                 severity       TEXT NOT NULL,
                 score          INTEGER NOT NULL DEFAULT 0,
                 score_breakdown TEXT,   -- JSON: détail du calcul par famille (Risk Engine)
+                score_details  TEXT,    -- JSON: règles individuelles (scoring de lignée de processus)
                 category       TEXT,
                 agent_id       TEXT,
                 timestamp      TEXT NOT NULL,
@@ -171,6 +173,8 @@ def init_db():
                 conn.execute("UPDATE alerts SET score = ? WHERE severity = ? AND score = 0", (sc, sev))
         if "score_breakdown" not in alert_cols:
             conn.execute("ALTER TABLE alerts ADD COLUMN score_breakdown TEXT")
+        if "score_details" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN score_details TEXT")
 
 
 # Score de repli si le Risk Engine n'a pas pu être appliqué (ex: alerte créée
@@ -256,21 +260,26 @@ def get_alerts(org_id, severity=None, limit=50):
                 a["score_breakdown"] = json.loads(a["score_breakdown"]) if a.get("score_breakdown") else {}
             except (TypeError, json.JSONDecodeError):
                 a["score_breakdown"] = {}
+            try:
+                a["score_details"] = json.loads(a["score_details"]) if a.get("score_details") else []
+            except (TypeError, json.JSONDecodeError):
+                a["score_details"] = []
             alerts.append(a)
         return alerts
 
 
 def create_alert(org_id, title, description, severity, category, agent_id, is_demo=False,
-                  score=None, score_breakdown=None):
+                  score=None, score_breakdown=None, score_details=None):
     alert_id = str(uuid.uuid4())
     if score is None:
         score = SEVERITY_SCORE.get(severity, 1)
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, category, agent_id, timestamp, acknowledged, is_demo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details, category, agent_id, timestamp, acknowledged, is_demo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         """, (alert_id, org_id, title, description, severity, score,
               json.dumps(score_breakdown) if score_breakdown else None,
+              json.dumps(score_details) if score_details else None,
               category, agent_id, datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0))
     return alert_id
 
@@ -643,9 +652,22 @@ def seed_demo(org_id):
 
     # Signaux représentatifs par bande de sévérité visée, validés pour
     # retomber dans le bon seuil du Risk Engine (voir risk_engine.THRESHOLDS).
+    # La bande "critical" utilise le vrai scoring de lignée de processus
+    # (process_scoring), exactement le scénario Outlook → Word → PowerShell
+    # → payload.exe décrit dans la documentation du moteur — pour montrer
+    # le panneau "Pourquoi cette alerte vaut X ?" avec des règles détaillées
+    # plutôt qu'un simple total par famille.
+    demo_ancestry_score = process_scoring.score_ancestry(
+        [
+            {"name": "outlook.exe", "path": r"C:\Program Files\Microsoft Office\OUTLOOK.EXE"},
+            {"name": "winword.exe", "path": r"C:\Program Files\Microsoft Office\WINWORD.EXE"},
+            {"name": "powershell.exe", "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"},
+            {"name": "payload.exe", "path": r"C:\Users\Public\AppData\Local\Temp\payload.exe"},
+        ],
+        sibling_interpreter_count=1,
+    )
     DEMO_SIGNALS_BY_SEVERITY = {
-        "critical": {"process_suspect": True, "ioc_hash_match": True, "lolbin_parent_child": True,
-                     "ioc_ip_match": True, "ioc_cmdline_match": True, "file_unknown": True},
+        "critical": {"process_scoring": demo_ancestry_score, "ioc_hash_match": True, "ioc_ip_match": True},
         "high":     {"process_suspect": True, "ioc_cmdline_match": True, "admin_or_system_user": True},
         "medium":   {"process_suspect": True, "ioc_cmdline_match": True},
         "low":      {"file_unknown": True},
@@ -660,12 +682,14 @@ def seed_demo(org_id):
             # La sévérité stockée est TOUJOURS celle calculée par le moteur
             # à partir des signaux — jamais choisie à la main, exactement
             # comme pour une vraie détection remontée par un agent.
-            score, breakdown, computed_sev = risk_engine.compute_risk(DEMO_SIGNALS_BY_SEVERITY.get(target_sev, {}))
+            score, breakdown, computed_sev, details = risk_engine.compute_risk(
+                DEMO_SIGNALS_BY_SEVERITY.get(target_sev, {})
+            )
             demo_alerts_info.append((alert_id, computed_sev, chosen_agent, cat))
             conn.execute("""
-                INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, category, agent_id, timestamp, acknowledged, is_demo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """, (alert_id, org_id, title, desc, computed_sev, score, json.dumps(breakdown), cat,
+                INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details, category, agent_id, timestamp, acknowledged, is_demo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (alert_id, org_id, title, desc, computed_sev, score, json.dumps(breakdown), json.dumps(details), cat,
                   chosen_agent, ts, acknowledged))
 
     # Arbre d'exécution de démo, rattaché à TOUTES les alertes critiques/hautes
