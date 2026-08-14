@@ -321,17 +321,18 @@ def get_recent_alerts_for_agent(org_id, agent_id, since_minutes):
         return alerts
 
 
-def has_recent_behavioural_alert(org_id, agent_id, cooldown_minutes):
-    """True si une alerte comportementale (category='comportemental') a déjà
-    été créée pour cette machine il y a moins de `cooldown_minutes` — évite
-    de spammer le dashboard d'une nouvelle alerte de corrélation à chaque
-    alerte brute reçue pendant un même incident en cours."""
+def has_recent_alert_of_category(org_id, agent_id, category, cooldown_minutes):
+    """True si une alerte de la catégorie donnée (ex: 'comportemental' pour
+    le Behaviour Engine, 'chaine_temporelle' pour le Temporal Correlator) a
+    déjà été créée pour cette machine il y a moins de `cooldown_minutes` —
+    évite de spammer le dashboard d'une nouvelle alerte de corrélation à
+    chaque évènement brut reçu pendant un même incident en cours."""
     since = (datetime.utcnow() - timedelta(minutes=cooldown_minutes)).isoformat(timespec="seconds")
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT 1 FROM alerts WHERE org_id = ? AND agent_id = ? AND category = 'comportemental' "
+            "SELECT 1 FROM alerts WHERE org_id = ? AND agent_id = ? AND category = ? "
             "AND timestamp >= ? LIMIT 1",
-            (org_id, agent_id, since),
+            (org_id, agent_id, category, since),
         ).fetchone()
         return row is not None
 
@@ -508,6 +509,27 @@ def get_process_tree(org_id, alert_id):
         rows = conn.execute(
             "SELECT * FROM process_events WHERE org_id = ? AND alert_id = ? ORDER BY timestamp",
             (org_id, alert_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_process_events_for_agent(org_id, agent_id, since_minutes):
+    """Tous les process_events d'UNE machine sur les `since_minutes`
+    dernières minutes, toutes détections (alert_id) confondues — entrée
+    du Temporal Correlator (temporal_correlator.correlate), qui a besoin
+    de voir plusieurs détections successives sur le même arbre de
+    processus pour reconstituer une chaîne au-delà d'une seule alerte.
+
+    Tri par (timestamp, rowid), même raison que get_recent_alerts_for_agent :
+    plusieurs évènements d'une même détection partagent la même seconde,
+    `rowid` (ordre d'insertion, implicite dans SQLite) départage sans
+    migration de schéma."""
+    since = (datetime.utcnow() - timedelta(minutes=since_minutes)).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM process_events WHERE org_id = ? AND agent_id = ? AND timestamp >= ? "
+            "ORDER BY timestamp, rowid",
+            (org_id, agent_id, since),
         ).fetchall()
         return [dict(r) for r in rows]
 

@@ -38,6 +38,7 @@ import db_users
 import db_data
 import risk_engine
 import behaviour_engine
+import temporal_correlator
 
 app = Flask(__name__)
 CORS(app)
@@ -396,8 +397,8 @@ def agent_alert():
     # signal isolé (voir behaviour_engine.py). Ne s'exécute pas si une
     # alerte comportementale a déjà été levée récemment pour cette machine
     # (cooldown), pour ne pas spammer le dashboard pendant un même incident.
-    if not db_data.has_recent_behavioural_alert(
-        request.org_id, data["agent_id"], behaviour_engine.CORRELATION_COOLDOWN_MINUTES
+    if not db_data.has_recent_alert_of_category(
+        request.org_id, data["agent_id"], "comportemental", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
     ):
         recent_alerts = db_data.get_recent_alerts_for_agent(
             request.org_id, data["agent_id"], behaviour_engine.CORRELATION_WINDOW_MINUTES
@@ -461,6 +462,41 @@ def agent_process_events():
             parent_name=ev.get("parent_name"),
             detail=ev.get("detail"),
         )
+
+    # Corrélation temporelle : ces nouveaux évènements, combinés à ceux de
+    # détections précédentes sur la même machine, dessinent-ils une chaîne
+    # d'exécution au fil du temps (voir temporal_correlator.py) ? Contrairement
+    # au Behaviour Engine (qui corrèle des alertes entières), ce moteur
+    # descend au niveau du pid/de l'arbre de processus. Même logique de
+    # cooldown pour éviter une alerte de corrélation à chaque nouvel envoi
+    # pendant un même incident en cours.
+    agent_id = data.get("agent_id", "")
+    if agent_id and not db_data.has_recent_alert_of_category(
+        request.org_id, agent_id, "chaine_temporelle", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
+    ):
+        recent_events = db_data.get_recent_process_events_for_agent(
+            request.org_id, agent_id, temporal_correlator.MAX_WINDOW_MINUTES
+        )
+        chains = temporal_correlator.correlate(recent_events)
+        if chains:
+            best = chains[0]
+            score, severity = temporal_correlator.severity_for_confidence(best["confidence"])
+            db_data.create_alert(
+                org_id=request.org_id,
+                title=f"{best['pattern_name']} sur {agent_id}",
+                description=(
+                    f"{best['events_count']} évènements sur {len(best['source_alert_ids'])} détections "
+                    f"({best['scope_level']}), sur {best['duration_seconds']:.0f}s — "
+                    f"complétude {best['completeness']*100:.0f}%, confiance {best['confidence']*100:.0f}%."
+                ),
+                severity=severity, category="chaine_temporelle",
+                agent_id=agent_id, score=score, score_breakdown=None,
+                score_details=[{
+                    "rule": f"Motif {best['pattern_id']} — {best['pattern_name']}",
+                    "points": score,
+                }],
+            )
+
     return jsonify({"success": True, "count": len(events)}), 201
 
 

@@ -1,0 +1,347 @@
+"""
+temporal_correlator.py — Corrélation temporelle des évènements de processus
+pour NHGuard.
+
+behaviour_engine.py corrèle des ALERTES entre elles (score_breakdown par
+famille, sur 30 min). Ce module descend d'un cran : il corrèle les
+ÉVÈNEMENTS DE PROCESSUS bruts (process_events — pid, parent_pid, type,
+détail) qui accompagnent chaque alerte, pour reconstituer une chaîne
+d'exécution même quand les alertes qui la composent, prises une par une,
+n'ont rien de spectaculaire.
+
+── Ce que l'agent envoie réellement (important pour comprendre ce module) ──
+edr_agent.py ne fait PAS remonter un flux continu d'évènements en temps
+réel. À CHAQUE détection, il capture un instantané complet — la lignée de
+processus ("process" × N, du plus vieil ancêtre au processus détecté), les
+connexions réseau en cours de ce processus ("network" × 0..N) puis le
+chemin de l'exécutable détecté ("file") — et envoie tout ça en un seul
+appel, tous ces évènements portant donc des horodatages quasiment
+identiques (voir build_process_ancestry() / handle_detection() dans
+edr_agent.py).
+
+Conséquence directe sur la conception : chercher une corrélation temporelle
+ENTRE les lignes d'UN MÊME instantané n'apporterait rien (elles sont déjà
+quasi simultanées par construction — les compter comme une "chaîne" ferait
+gonfler la confiance de CHAQUE détection sans second signal réel). La
+vraie valeur est ENTRE deux instantanés distincts (deux détections, donc
+deux alert_id différents) sur le MÊME arbre de processus, potentiellement
+à plusieurs secondes, minutes, voire dizaines de minutes d'écart — c'est
+précisément le genre de lien qu'un analyste recollerait à la main en
+comparant plusieurs alertes, et que ni le Risk Engine (une alerte à la
+fois) ni le Behaviour Engine (des catégories de score, pas des pid) ne
+voient directement.
+
+C'est pourquoi ce module raisonne en "détections" (un instantané = un
+alert_id = un point dans le temps), pas en lignes individuelles : une
+correspondance de motif n'est retenue QUE si ses étapes proviennent d'AU
+MOINS DEUX détections distinctes sur le même arbre de processus — cette
+règle, à elle seule, écarte par construction le cas dégénéré où une seule
+détection "matcherait" tout un motif avec elle-même.
+
+Portée de corrélation (2 niveaux, pas 4) : la portée la plus forte est
+l'arbre de processus — toutes les détections dont les pid/parent_pid se
+recoupent (reconstruit par union-find, ce qui fusionne naturellement
+"même processus" et "parent → enfant" en un seul mécanisme). En repli
+seulement, si aucun motif n'a matché à ce niveau, une passe plus large
+regroupe TOUTES les détections de la machine sans tenir compte du pid —
+plus faible, donc plafonnée à une confiance plus basse (voir
+HOST_SCOPE_CONFIDENCE_PENALTY). Un niveau "même utilisateur" existerait
+en théorie (cf. document source) mais process_events n'a pas de colonne
+utilisateur aujourd'hui : plutôt que d'inventer un signal que la donnée
+ne supporte pas, ce niveau est volontairement omis.
+
+Comme risk_engine.py et behaviour_engine.py : fonction pure, sans effet
+de bord, sans dépendance externe, et sans état persistant entre appels —
+une "chaîne" qui vieillit hors de la fenêtre de corrélation disparaît
+simplement du prochain calcul (pas besoin d'un mécanisme d'expiration
+séparé), et une chaîne qui se complète progressivement produira
+naturellement une confiance plus élevée au fil des appels suivants, à
+mesure que de nouvelles détections rejoignent la fenêtre.
+"""
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+import risk_engine
+
+# ──────────────────────────────────────────────────────────
+# Motifs connus : séquence ORDONNÉE de types d'évènements (parmi ceux
+# réellement émis par l'agent : "process", "file", "network" — "registry"
+# est réservé dans le schéma mais pas encore émis, donc pas utilisé ici),
+# et fenêtre au-delà de laquelle deux détections ne sont plus considérées
+# comme le même épisode.
+#
+# Les fenêtres sont calibrées à l'échelle d'une DÉTECTION (plusieurs
+# secondes à plusieurs dizaines de minutes), pas à l'échelle de la
+# milliseconde, puisqu'une "étape" ici est une détection entière et non
+# un évènement isolé — voir l'en-tête du module.
+# ──────────────────────────────────────────────────────────
+TEMPORAL_PATTERNS = [
+    {
+        "id": "TC-001",
+        "name": "Exécution suivie d'un dépôt de fichier puis d'une connexion réseau",
+        "steps": ["process", "file", "network"],
+        "window_seconds": 5 * 60,
+    },
+    {
+        "id": "TC-002",
+        "name": "Connexion réseau suivie d'un fichier déposé (téléchargement puis exécution)",
+        "steps": ["network", "file"],
+        "window_seconds": 10 * 60,
+    },
+    {
+        "id": "TC-003",
+        "name": "Exécutions répétées sur la même lignée de processus",
+        "steps": ["process", "process"],
+        "window_seconds": 20 * 60,
+    },
+]
+
+# Fenêtre maximale parmi tous les motifs : sert de référence à l'appelant
+# pour savoir jusqu'où remonter dans process_events (voir
+# db_data.get_recent_process_events_for_agent).
+MAX_WINDOW_MINUTES = max(p["window_seconds"] for p in TEMPORAL_PATTERNS) // 60
+
+# En dessous de cette complétude (fraction d'étapes du motif satisfaites),
+# une correspondance partielle n'est pas jugée assez significative.
+MIN_COMPLETENESS = 0.5
+
+# En dessous de cette confiance finale, rien n'est retenu — voir
+# _confidence() : la confiance combine complétude (poids dominant) et
+# resserrement temporel (modulateur), jamais l'un sans l'autre.
+MIN_CONFIDENCE_TO_ALERT = 0.55
+
+# Portée "machine entière" (repli, sans tenir compte du pid) : preuve plus
+# faible qu'une portée "arbre de processus", donc confiance pénalisée.
+HOST_SCOPE_CONFIDENCE_PENALTY = 0.6
+
+
+def _parse_ts(ts):
+    try:
+        return datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def _timing_factor(delta_seconds):
+    """Plus deux détections successives sont rapprochées, plus il est
+    probable qu'elles décrivent un seul épisode continu plutôt que deux
+    incidents sans rapport — mais ce facteur ne fait que MODULER la
+    confiance (voir _confidence), jamais la créer à lui seul : un
+    enchaînement rapide sans complétude suffisante ne déclenche rien."""
+    if delta_seconds < 30:
+        return 1.0
+    if delta_seconds < 3 * 60:
+        return 0.85
+    if delta_seconds < 15 * 60:
+        return 0.6
+    return 0.4
+
+
+def _confidence(completeness, matched_batches):
+    if len(matched_batches) < 2:
+        return 0.0
+    deltas = [
+        (b["ts"] - matched_batches[i - 1]["ts"]).total_seconds()
+        for i, b in enumerate(matched_batches) if i > 0
+    ]
+    avg_delta = sum(deltas) / len(deltas)
+    timing = _timing_factor(avg_delta)
+    # La complétude domine (poids 0.7) : un timing parfait ne peut jamais,
+    # à lui seul, rattraper une chaîne peu complète (cf. en-tête du module,
+    # "le temps doit renforcer un comportement existant, pas en créer un").
+    return round(completeness * (0.7 + 0.3 * timing), 2)
+
+
+def _process_tree_groups(events):
+    """Regroupe les évènements en composantes connexes de la relation
+    pid <-> parent_pid (union-find, sans dépendance externe) : un même
+    "arbre de processus", même s'il a été observé par plusieurs
+    détections distinctes. Les évènements sans pid ne sont rattachables
+    à aucun arbre et sont ignorés (aucun cas de ce type observé dans les
+    données actuelles de l'agent, mais on ne suppose pas leur absence)."""
+    parent_of = {}
+
+    def find(x):
+        root = x
+        while parent_of.get(root, root) != root:
+            root = parent_of[root]
+        while parent_of.get(x, x) != root:
+            parent_of[x], x = root, parent_of.get(x, x)
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent_of[ra] = rb
+
+    for e in events:
+        pid, ppid = e.get("pid"), e.get("parent_pid")
+        if pid is not None:
+            parent_of.setdefault(pid, pid)
+        if ppid is not None:
+            parent_of.setdefault(ppid, ppid)
+        if pid is not None and ppid is not None:
+            union(pid, ppid)
+
+    groups = defaultdict(list)
+    for e in events:
+        pid = e.get("pid")
+        if pid is not None:
+            groups[find(pid)].append(e)
+    return list(groups.values())
+
+
+def _batches(events):
+    """Regroupe les évènements par détection d'origine (alert_id) : chaque
+    détection envoie un instantané quasi simultané (voir en-tête du
+    module), donc l'unité de corrélation pertinente est la détection
+    entière, pas la ligne individuelle. Les doublons EXACTS qu'un agent
+    peut renvoyer d'une détection à l'autre (ex: la même lignée d'ancêtres
+    ré-observée) sont absorbés naturellement par le `set` de types
+    ci-dessous — pas besoin d'une étape de déduplication séparée."""
+    grouped = defaultdict(list)
+    for e in events:
+        grouped[e.get("alert_id")].append(e)
+
+    batches = []
+    for alert_id, evs in grouped.items():
+        timestamps = [t for t in (_parse_ts(e.get("timestamp")) for e in evs) if t]
+        if not timestamps:
+            continue
+        batches.append({
+            "alert_id": alert_id,
+            "types": {e.get("event_type") for e in evs if e.get("event_type")},
+            "ts": min(timestamps),
+            "events": evs,
+        })
+    batches.sort(key=lambda b: b["ts"])
+    return batches
+
+
+def _match_pattern(pattern, batches):
+    """Cherche la MEILLEURE correspondance (la plus complète) du motif
+    dans la séquence de détections `batches`, déjà triée chronologiquement.
+    Chaque étape du motif doit provenir d'une détection STRICTEMENT
+    postérieure à celle de l'étape précédente : c'est cette contrainte,
+    et non un filtre ajouté après coup, qui garantit qu'une correspondance
+    complète nécessite toujours au moins `len(steps)` détections
+    distinctes — impossible qu'une seule détection se corrèle avec
+    elle-même."""
+    steps = pattern["steps"]
+    window = timedelta(seconds=pattern["window_seconds"])
+    best = None
+
+    for start in range(len(batches)):
+        if steps[0] not in batches[start]["types"]:
+            continue
+        t0 = batches[start]["ts"]
+        matched = [batches[start]]
+        step_i = 1
+        for b in batches[start + 1:]:
+            if step_i >= len(steps):
+                break
+            if b["ts"] - t0 > window:
+                break
+            if steps[step_i] in b["types"]:
+                matched.append(b)
+                step_i += 1
+        if len(matched) >= 2 and (best is None or len(matched) > len(best)):
+            best = matched
+
+    return best
+
+
+def _finalize(pattern, matched_batches, scope_level, confidence_penalty=1.0):
+    completeness = len(matched_batches) / len(pattern["steps"])
+    if completeness < MIN_COMPLETENESS:
+        return None
+
+    confidence = round(_confidence(completeness, matched_batches) * confidence_penalty, 2)
+    if confidence < MIN_CONFIDENCE_TO_ALERT:
+        return None
+
+    duration = (matched_batches[-1]["ts"] - matched_batches[0]["ts"]).total_seconds()
+    root_pid = next(
+        (e.get("pid") for e in matched_batches[0]["events"] if e.get("pid") is not None), None
+    )
+    source_event_ids = [e["id"] for b in matched_batches for e in b["events"] if e.get("id")]
+
+    return {
+        "pattern_id": pattern["id"],
+        "pattern_name": pattern["name"],
+        "scope_level": scope_level,
+        "root_pid": root_pid,
+        "events_count": sum(len(b["events"]) for b in matched_batches),
+        "duration_seconds": round(duration, 1),
+        "completeness": round(completeness, 2),
+        "confidence": confidence,
+        "source_alert_ids": [b["alert_id"] for b in matched_batches if b.get("alert_id")],
+        "source_event_ids": source_event_ids,
+    }
+
+
+def severity_for_confidence(confidence):
+    """Convertit une confiance (0-1) en sévérité, en réutilisant l'échelle
+    0-100 du Risk Engine (risk_engine.THRESHOLDS) plutôt que d'en inventer
+    une nouvelle — même logique que behaviour_engine._severity_for_score,
+    pour une seule échelle cohérente dans tout NHGuard."""
+    score = round(confidence * 100)
+    for threshold, label in risk_engine.THRESHOLDS:
+        if score >= threshold:
+            return score, label
+    return score, "low"
+
+
+def correlate(events):
+    """events : tous les process_events RÉCENTS d'UNE SEULE machine
+    (déjà filtrés par agent_id et par MAX_WINDOW_MINUTES côté appelant —
+    voir db_data.get_recent_process_events_for_agent), dans n'importe
+    quel ordre, toutes détections/alert_id confondus.
+
+    Retourne la liste des chaînes détectées (une par motif × arbre de
+    processus où une correspondance suffisante a été trouvée, plus
+    d'éventuelles correspondances "machine entière" en repli), triée par
+    confiance décroissante. Liste vide — le cas normal, largement
+    majoritaire — si rien d'assez significatif n'a été trouvé.
+    """
+    if not events:
+        return []
+
+    results = []
+    tree_groups = _process_tree_groups(events)
+
+    patterns_matched_by_tree = set()
+    for group in tree_groups:
+        batches = _batches(group)
+        if len(batches) < 2:
+            continue
+        for pattern in TEMPORAL_PATTERNS:
+            matched = _match_pattern(pattern, batches)
+            if not matched:
+                continue
+            chain = _finalize(pattern, matched, scope_level="process_tree")
+            if chain:
+                results.append(chain)
+                patterns_matched_by_tree.add(pattern["id"])
+
+    # Repli "machine entière" : seulement pour les motifs qu'AUCUN arbre
+    # de processus n'a déjà expliqué — évite de doubler un signal déjà
+    # remonté à un niveau de preuve plus fort.
+    host_batches = _batches(events)
+    if len(host_batches) >= 2:
+        for pattern in TEMPORAL_PATTERNS:
+            if pattern["id"] in patterns_matched_by_tree:
+                continue
+            matched = _match_pattern(pattern, host_batches)
+            if not matched:
+                continue
+            chain = _finalize(
+                pattern, matched, scope_level="host",
+                confidence_penalty=HOST_SCOPE_CONFIDENCE_PENALTY,
+            )
+            if chain:
+                results.append(chain)
+
+    results.sort(key=lambda c: c["confidence"], reverse=True)
+    return results
