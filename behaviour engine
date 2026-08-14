@@ -21,13 +21,28 @@ Principe (inspiré de MITRE ATT&CK, simplifié à l'échelle du produit) :
     part, indépendant des tactiques en jeu — souvent le signe d'une
     attaque automatisée/scriptée ou d'un outil bruyant
 
+── Hiérarchie du pipeline (et non deux moteurs parallèles) ──
+    Raw Events (process_events) → Temporal Correlator → Behaviour Chains → Risk Engine
+temporal_correlator.py travaille sur les évènements de processus bruts
+(pid/parent_pid) et prouve une continuité STRUCTURELLE (même arbre de
+processus observé sur plusieurs détections). C'est une preuve plus forte
+qu'une simple coïncidence temporelle entre catégories de score. Plutôt
+que de laisser le Temporal Correlator publier sa propre alerte
+indépendante (ancienne conception : deux moteurs de corrélation
+produisant chacun leur vision du "comportement", jamais recroisées), ses
+chaînes détectées sont maintenant une ENTRÉE de ce module (paramètre
+`temporal_chains` de evaluate()) : le Behaviour Engine est le point de
+synthèse UNIQUE qui combine corrélation d'alertes (ce module) et
+corrélation d'évènements (Temporal Correlator) en un seul verdict, avant
+de le transmettre au Risk Engine (réutilisation de THRESHOLDS/gating).
+
 Ce module ne DÉCIDE PAS quand s'exécuter ni comment persister son
-verdict (voir edr_server.py, appelant get_recent_alerts_for_agent()
-côté base puis evaluate() ici, avant de créer — ou non — une alerte de
-catégorie "comportemental"). Il reste une fonction pure, sans effet de
-bord, testable indépendamment du serveur — même logique de conception
-que risk_engine.py et process_scoring.py, et volontairement dépourvu de
-dépendances externes.
+verdict (voir edr_server.py, seul point d'orchestration : il assemble
+alertes récentes + chaînes temporelles puis appelle evaluate() ici, avant
+de créer — ou non — une alerte de catégorie "comportemental"). Il reste
+une fonction pure, sans effet de bord, testable indépendamment du
+serveur — même logique de conception que risk_engine.py et
+process_scoring.py, et volontairement dépourvu de dépendances externes.
 """
 
 from datetime import datetime, timedelta
@@ -117,6 +132,20 @@ BURST_POINTS = 25
 DISTINCT_TACTICS_POINTS = 30
 KNOWN_PATTERN_POINTS = 45
 
+# Une chaîne confirmée par le Temporal Correlator (temporal_chains,
+# paramètre de evaluate()) est la preuve la plus forte du pipeline : une
+# continuité STRUCTURELLE (même pid/lignée de processus) sur au moins deux
+# détections distinctes, pas une simple coïncidence de catégories dans le
+# temps. Mise à l'échelle de 0-100 par sa propre confiance : à confiance
+# quasi certaine, une SEULE chaîne temporelle doit pouvoir, à elle seule,
+# franchir MIN_SCORE_TO_ALERT — avant la fusion des deux moteurs, le
+# Temporal Correlator publiait déjà sa propre alerte sur cette seule base
+# (confiance → sévérité, sans plancher de points) ; ce module ne doit pas
+# être moins sensible que l'ancien moteur autonome qu'il remplace, tout en
+# pouvant maintenant aussi se renforcer avec les autres preuves (rafale,
+# tactiques distinctes, motif connu) plutôt que de rester isolé.
+TEMPORAL_CHAIN_POINTS_SCALE = 100
+
 
 def _tactics_for_alert(alert):
     """Retourne l'ensemble des tactiques concernées par une alerte."""
@@ -151,16 +180,22 @@ def _pattern_present(pattern, ordered_tactics):
     return all(step in it for step in pattern)
 
 
-def _confidence(windowed):
+def _confidence(windowed, temporal_chains=None):
     """Confiance de la chaîne : même formule que risk_engine.compute_risk()
-    (moyenne des certitudes intrinsèques CONFIDENCE_WEIGHTS, pondérée par
-    les points de chaque famille de signal) — réutilisée telle quelle,
-    étendue sur TOUTES les alertes corrélées plutôt qu'une seule, pour une
-    seule notion de confiance cohérente dans tout NHGuard. Une chaîne
-    construite sur des signaux "Réputation" (le plus incertain de la
-    table, cf. risk_engine.py) hérite naturellement d'une confiance basse,
-    sans règle spéciale à écrire ici — c'est la Gestion UNKNOWN qui se
-    propage depuis le Risk Engine jusqu'au Behaviour Engine.
+    (moyenne des certitudes intrinsèques, pondérée par les points de
+    chaque famille de signal) — réutilisée telle quelle, étendue sur
+    TOUTES les alertes corrélées PLUS les chaînes temporelles éventuelles,
+    pour une seule notion de confiance cohérente dans tout NHGuard. Une
+    chaîne construite sur des signaux "Réputation" (le plus incertain de
+    la table, cf. risk_engine.py) hérite naturellement d'une confiance
+    basse, sans règle spéciale à écrire ici — c'est la Gestion UNKNOWN qui
+    se propage depuis le Risk Engine jusqu'au Behaviour Engine.
+
+    Chaque chaîne du Temporal Correlator (voir TEMPORAL_CHAIN_POINTS_SCALE)
+    entre dans la MÊME moyenne pondérée, avec sa propre confiance comme
+    "certitude" et ses points comme poids — exactement le même traitement
+    qu'une famille de signal Risk Engine, ce qui matérialise la hiérarchie
+    du pipeline (les deux sources de preuve convergent vers UN seul calcul).
 
     Une alerte sans score_breakdown exploitable (agent ancien, test)
     contribue avec un poids nominal à confiance basse plutôt que d'être
@@ -181,6 +216,13 @@ def _confidence(windowed):
             weighted_sum += risk_engine.BASELINE_CONFIDENCE_NO_SIGNAL
             total_weight += 1
 
+    for chain in (temporal_chains or []):
+        pts = round(chain["confidence"] * TEMPORAL_CHAIN_POINTS_SCALE)
+        if pts <= 0:
+            continue
+        weighted_sum += pts * chain["confidence"]
+        total_weight += pts
+
     if total_weight == 0:
         return risk_engine.BASELINE_CONFIDENCE_NO_SIGNAL
     return round(max(0.0, min(1.0, weighted_sum / total_weight)), 2)
@@ -196,11 +238,18 @@ def _severity_for_score(score):
     return "low"
 
 
-def evaluate(alerts, now=None):
+def evaluate(alerts, temporal_chains=None, now=None):
     """alerts : alertes d'UNE SEULE machine (déjà filtrées par agent_id
     côté appelant, voir db_data.get_recent_alerts_for_agent), dans
     n'importe quel ordre — ce module se charge de les trier et de ne
     garder que celles tombant dans la fenêtre de corrélation.
+
+    temporal_chains : chaînes détectées par temporal_correlator.correlate()
+    pour la MÊME machine (optionnel) — voir l'en-tête du module : c'est la
+    preuve la plus forte du pipeline (continuité de pid/lignée de
+    processus sur au moins deux détections distinctes), intégrée ici au
+    même titre qu'une famille de signal Risk Engine plutôt que publiée
+    comme une alerte séparée par un moteur concurrent.
 
     now : horodatage de référence (datetime), pour des tests déterministes.
     Par défaut : l'instant présent.
@@ -218,21 +267,44 @@ def evaluate(alerts, now=None):
         }
     prêt à être passé à db_data.create_alert(category="comportemental", ...).
     """
-    if not alerts:
+    temporal_chains = temporal_chains or []
+    if not alerts and not temporal_chains:
         return None
 
     now = now or datetime.utcnow()
     window_start = now - timedelta(minutes=CORRELATION_WINDOW_MINUTES)
 
     windowed = [a for a in alerts if (_parse_ts(a.get("timestamp")) or window_start) >= window_start]
-    if len(windowed) < 2:
-        return None  # une seule alerte ne peut jamais constituer, à elle seule, un "comportement"
+    # Repli : normalement une seule alerte ne prouve jamais, à elle seule,
+    # un "comportement" — SAUF si le Temporal Correlator apporte déjà sa
+    # propre preuve structurelle indépendante (au moins deux détections
+    # distinctes reliées par pid, garanti par sa propre conception).
+    if len(windowed) < 2 and not temporal_chains:
+        return None
 
     windowed.sort(key=lambda a: a.get("timestamp") or "")
     source_ids = [a["id"] for a in windowed if a.get("id")]
-    agent_label = windowed[-1].get("agent_id") or "?"
+    agent_label = next(
+        (a.get("agent_id") for a in reversed(alerts) if a.get("agent_id")), "?"
+    )
 
     details = []
+    temporal_chain_used = False
+
+    # 0. Chaînes du Temporal Correlator — voir l'en-tête du module. Chaque
+    #    chaîne devient sa propre ligne de preuve, mise à l'échelle par sa
+    #    confiance propre plutôt qu'à points fixes.
+    for chain in temporal_chains:
+        pts = round(chain["confidence"] * TEMPORAL_CHAIN_POINTS_SCALE)
+        if pts <= 0:
+            continue
+        details.append({
+            "rule": f"Corrélation temporelle : {chain['pattern_name']} "
+                    f"({chain['scope_level']}, confiance {chain['confidence']*100:.0f}%)",
+            "points": pts,
+        })
+        source_ids.extend(a_id for a_id in chain.get("source_alert_ids", []) if a_id not in source_ids)
+        temporal_chain_used = True
 
     # 1. Rafale : beaucoup d'alertes dans une fenêtre courte, quelles que
     #    soient les tactiques en jeu — souvent un outil automatisé/scripté.
@@ -273,7 +345,7 @@ def evaluate(alerts, now=None):
 
     score = max(0, min(100, sum(d["points"] for d in details)))
     severity = _severity_for_score(score)
-    confidence = _confidence(windowed)
+    confidence = _confidence(windowed, temporal_chains)
 
     # Même garde-fou que risk_engine.compute_risk() : une chaîne à
     # confiance insuffisante ne peut pas s'afficher au-dessus du plafond,
@@ -285,7 +357,12 @@ def evaluate(alerts, now=None):
     if severity not in ("high", "critical") or score < MIN_SCORE_TO_ALERT:
         return None  # le bruit de faible intensité reste géré alerte par alerte par le Risk Engine
 
-    if chain_matches:
+    # Le titre reflète la preuve la plus forte disponible — une chaîne
+    # temporelle (continuité de pid) prime sur une simple coïncidence de
+    # catégories, qui prime elle-même sur une rafale sans motif précis.
+    if temporal_chain_used:
+        title = f"Chaîne comportementale confirmée (corrélation temporelle) sur {agent_label}"
+    elif chain_matches:
         title = f"Chaîne d'attaque détectée sur {agent_label}"
     elif len(distinct_tactics) >= MIN_TACTICS_FOR_CHAIN:
         title = f"Comportement multi-tactiques suspect sur {agent_label}"
@@ -293,8 +370,10 @@ def evaluate(alerts, now=None):
         title = f"Rafale d'alertes suspecte sur {agent_label}"
 
     description = (
-        f"{len(windowed)} alertes corrélées sur les {CORRELATION_WINDOW_MINUTES} dernières "
-        f"minutes ({', '.join(distinct_tactics) if distinct_tactics else 'tactique unique'})."
+        f"{len(windowed)} alertes corrélées sur les {CORRELATION_WINDOW_MINUTES} dernières minutes"
+        + (f" ({', '.join(distinct_tactics)})" if distinct_tactics else "")
+        + (f" + {len(temporal_chains)} chaîne(s) temporelle(s) confirmée(s)" if temporal_chains else "")
+        + "."
     )
 
     return {

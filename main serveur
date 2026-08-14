@@ -364,6 +364,42 @@ def agent_report():
     return jsonify({"success": True})
 
 
+def _run_behavior_correlation(org_id, agent_id):
+    """Point d'entrée UNIQUE de la corrélation comportementale — voir
+    behaviour_engine.py : Raw Events -> Temporal Correlator -> Behaviour
+    Chains -> Risk Engine. Avant, agent_alert() et agent_process_events()
+    appelaient chacun leur propre moteur de corrélation indépendamment
+    (behaviour_engine sur l'historique d'alertes, temporal_correlator sur
+    les process_events), produisant deux catégories d'alerte séparées
+    ("comportemental" / "chaine_temporelle") qui ne se recoupaient jamais.
+    Les deux routes appellent maintenant CETTE fonction : les chaînes
+    temporelles sont une ENTRÉE du Behaviour Engine, pas un moteur
+    concurrent — une seule alerte de synthèse en résulte, jamais deux."""
+    if not agent_id or db_data.has_recent_alert_of_category(
+        org_id, agent_id, "comportemental", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
+    ):
+        return
+
+    recent_alerts = db_data.get_recent_alerts_for_agent(
+        org_id, agent_id, behaviour_engine.CORRELATION_WINDOW_MINUTES
+    )
+    recent_events = db_data.get_recent_process_events_for_agent(
+        org_id, agent_id, temporal_correlator.MAX_WINDOW_MINUTES
+    )
+    temporal_chains = temporal_correlator.correlate(recent_events)
+
+    verdict = behaviour_engine.evaluate(recent_alerts, temporal_chains=temporal_chains)
+    if verdict:
+        db_data.create_alert(
+            org_id=org_id,
+            title=verdict["title"], description=verdict["description"],
+            severity=verdict["severity"], category="comportemental",
+            agent_id=agent_id, score=verdict["score"],
+            score_breakdown=None, score_details=verdict["details"],
+            confidence=verdict["confidence"], is_correlation=True,
+        )
+
+
 @app.route("/api/agents/alert", methods=["POST"])
 @require_agent_key
 def agent_alert():
@@ -397,28 +433,7 @@ def agent_alert():
         threat_score=threat_score, impact_score=impact_score,
     )
 
-    # Corrélation comportementale : regarde si cette alerte, combinée aux
-    # précédentes de la même machine sur la fenêtre glissante, dessine une
-    # chaîne d'attaque ou un comportement multi-tactiques plus large qu'un
-    # signal isolé (voir behaviour_engine.py). Ne s'exécute pas si une
-    # alerte comportementale a déjà été levée récemment pour cette machine
-    # (cooldown), pour ne pas spammer le dashboard pendant un même incident.
-    if not db_data.has_recent_alert_of_category(
-        request.org_id, data["agent_id"], "comportemental", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
-    ):
-        recent_alerts = db_data.get_recent_alerts_for_agent(
-            request.org_id, data["agent_id"], behaviour_engine.CORRELATION_WINDOW_MINUTES
-        )
-        verdict = behaviour_engine.evaluate(recent_alerts)
-        if verdict:
-            db_data.create_alert(
-                org_id=request.org_id,
-                title=verdict["title"], description=verdict["description"],
-                severity=verdict["severity"], category="comportemental",
-                agent_id=data["agent_id"], score=verdict["score"],
-                score_breakdown=None, score_details=verdict["details"],
-                confidence=verdict["confidence"], is_correlation=True,
-            )
+    _run_behavior_correlation(request.org_id, data["agent_id"])
 
     return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
 
@@ -470,40 +485,7 @@ def agent_process_events():
             detail=ev.get("detail"),
         )
 
-    # Corrélation temporelle : ces nouveaux évènements, combinés à ceux de
-    # détections précédentes sur la même machine, dessinent-ils une chaîne
-    # d'exécution au fil du temps (voir temporal_correlator.py) ? Contrairement
-    # au Behaviour Engine (qui corrèle des alertes entières), ce moteur
-    # descend au niveau du pid/de l'arbre de processus. Même logique de
-    # cooldown pour éviter une alerte de corrélation à chaque nouvel envoi
-    # pendant un même incident en cours.
-    agent_id = data.get("agent_id", "")
-    if agent_id and not db_data.has_recent_alert_of_category(
-        request.org_id, agent_id, "chaine_temporelle", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
-    ):
-        recent_events = db_data.get_recent_process_events_for_agent(
-            request.org_id, agent_id, temporal_correlator.MAX_WINDOW_MINUTES
-        )
-        chains = temporal_correlator.correlate(recent_events)
-        if chains:
-            best = chains[0]
-            score, severity = temporal_correlator.severity_for_confidence(best["confidence"])
-            db_data.create_alert(
-                org_id=request.org_id,
-                title=f"{best['pattern_name']} sur {agent_id}",
-                description=(
-                    f"{best['events_count']} évènements sur {len(best['source_alert_ids'])} détections "
-                    f"({best['scope_level']}), sur {best['duration_seconds']:.0f}s — "
-                    f"complétude {best['completeness']*100:.0f}%, confiance {best['confidence']*100:.0f}%."
-                ),
-                severity=severity, category="chaine_temporelle",
-                agent_id=agent_id, score=score, score_breakdown=None,
-                score_details=[{
-                    "rule": f"Motif {best['pattern_id']} — {best['pattern_name']}",
-                    "points": score,
-                }],
-                confidence=best["confidence"], is_correlation=True,
-            )
+    _run_behavior_correlation(request.org_id, data.get("agent_id", ""))
 
     return jsonify({"success": True, "count": len(events)}), 201
 

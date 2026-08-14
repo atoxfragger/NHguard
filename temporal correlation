@@ -62,8 +62,6 @@ mesure que de nouvelles détections rejoignent la fenêtre.
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-import risk_engine
-
 # ──────────────────────────────────────────────────────────
 # Motifs connus : séquence ORDONNÉE de types d'évènements (parmi ceux
 # réellement émis par l'agent : "process", "file", "network" — "registry"
@@ -279,18 +277,6 @@ def _finalize(pattern, matched_batches, scope_level, confidence_penalty=1.0):
         "source_alert_ids": [b["alert_id"] for b in matched_batches if b.get("alert_id")],
         "source_event_ids": source_event_ids,
     }
-
-
-def severity_for_confidence(confidence):
-    """Convertit une confiance (0-1) en sévérité, en réutilisant l'échelle
-    0-100 du Risk Engine (risk_engine.THRESHOLDS) plutôt que d'en inventer
-    une nouvelle — même logique que behaviour_engine._severity_for_score,
-    pour une seule échelle cohérente dans tout NHGuard."""
-    score = round(confidence * 100)
-    for threshold, label in risk_engine.THRESHOLDS:
-        if score >= threshold:
-            return score, label
-    return score, "low"
 
 
 def correlate(events):
