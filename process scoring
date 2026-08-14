@@ -1,0 +1,190 @@
+"""
+process_scoring.py — Scoring de la lignée de processus pour NHGuard
+(réputation, parent → enfant, chaîne grand-parent → parent → enfant,
+emplacement du fichier, profondeur inhabituelle).
+
+Principe : au lieu de juger un processus isolément ("powershell.exe"),
+on juge la RELATION ("powershell.exe lancé par winword.exe, depuis
+%TEMP%, dans une chaîne de 4 processus") — c'est ce qui permet de
+détecter du comportement malveillant même sans hash ni IoC connus.
+
+Règles structurées (pas de centaines de conditions if/else en dur) pour
+rester lisible et faciles à faire évoluer. Chaque règle documente
+explicitement pourquoi elle a été déclenchée, pour alimenter le panneau
+"Pourquoi cette alerte vaut X ?" du dashboard — voir le point du
+document source sur le double comptage : ce module remplace entièrement
+les catégories process/parent_child/file du Risk Engine plutôt que de
+s'y additionner, précisément pour éviter de compter un même signal
+plusieurs fois.
+"""
+
+# ──────────────────────────────────────────────────────────
+# Réputation de base par nom de processus. Ne signifie PAS "malveillant" —
+# signifie "mérite davantage de contexte" (cf. LOLBins : des binaires
+# Windows légitimes détournés par des attaques réelles).
+# ──────────────────────────────────────────────────────────
+PROCESS_BASE_SCORES = {
+    "explorer.exe": 0, "chrome.exe": 0, "msedge.exe": 0, "firefox.exe": 0,
+    "svchost.exe": 0, "notepad.exe": 0,
+    "powershell.exe": 5, "pwsh.exe": 5, "cmd.exe": 3,
+    "wscript.exe": 8, "cscript.exe": 8, "mshta.exe": 12,
+    "rundll32.exe": 8, "regsvr32.exe": 8, "certutil.exe": 8, "bitsadmin.exe": 10,
+}
+
+# ──────────────────────────────────────────────────────────
+# Règles parent -> enfant. À terme, à externaliser dans un fichier JSON
+# versionné (rules/process_parent_child.json) plutôt que dans le code —
+# la structure ci-dessous est déjà prête pour ça.
+# ──────────────────────────────────────────────────────────
+PARENT_CHILD_RULES = {
+    ("winword.exe", "powershell.exe"): 25,
+    ("winword.exe", "cmd.exe"): 25,
+    ("winword.exe", "wscript.exe"): 25,
+    ("winword.exe", "mshta.exe"): 25,
+    ("excel.exe", "powershell.exe"): 25,
+    ("excel.exe", "cmd.exe"): 25,
+    ("excel.exe", "wscript.exe"): 25,
+    ("powerpnt.exe", "powershell.exe"): 25,
+    ("outlook.exe", "powershell.exe"): 20,
+    ("outlook.exe", "cmd.exe"): 20,
+    ("powershell.exe", "cmd.exe"): 10,
+    ("powershell.exe", "wscript.exe"): 15,
+    ("powershell.exe", "cscript.exe"): 15,
+    ("powershell.exe", "bitsadmin.exe"): 20,
+    ("powershell.exe", "certutil.exe"): 15,
+    ("cmd.exe", "powershell.exe"): 10,
+    ("mshta.exe", "powershell.exe"): 20,
+    ("explorer.exe", "chrome.exe"): 0,
+    ("explorer.exe", "notepad.exe"): 0,
+}
+
+# Chaînes grand-parent -> parent -> enfant : plus précises qu'une simple
+# paire, car un même parent/enfant peut être bien plus ou moins inquiétant
+# selon ce qui l'a lui-même lancé (ex: Outlook -> Word -> PowerShell).
+CHAIN_RULES = [
+    # (ensemble grand-parents, ensemble parents, ensemble enfants, bonus)
+    ({"outlook.exe"}, {"winword.exe", "excel.exe", "powerpnt.exe"},
+     {"powershell.exe", "cmd.exe", "wscript.exe", "mshta.exe"}, 15),
+]
+
+# Emplacements de fichier suspects — un même exécutable est bien plus
+# inquiétant lancé depuis %TEMP% que depuis son dossier d'installation.
+PATH_SIGNALS = [
+    ("\\appdata\\local\\temp\\", 20),
+    ("\\windows\\temp\\", 20),
+    ("\\appdata\\roaming\\", 15),
+    ("\\downloads\\", 10),
+]
+
+MULTI_INTERPRETER_BONUS = 20   # un même parent lance plusieurs interpréteurs différents
+DEPTH_BONUS_PER_LEVEL = 5      # profondeur de chaîne inhabituelle...
+MAX_DEPTH_BONUS = 10           # ...plafonnée pour ne pas générer de faux positifs
+SIGNED_MS_DISCOUNT = -10       # emplacement système Windows connu (proxy de signature)
+
+INTERPRETER_NAMES = {"powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe",
+                      "cscript.exe", "mshta.exe"}
+
+
+def _path_signal(path):
+    if not path:
+        return 0, None
+    p = path.lower().replace("/", "\\")
+    for needle, pts in PATH_SIGNALS:
+        if needle in p:
+            return pts, needle.strip("\\")
+    return 0, None
+
+
+def score_ancestry(ancestry, sibling_interpreter_count=0):
+    """ancestry : liste ordonnée du PLUS ANCIEN ancêtre vers le processus
+    détecté — chaque élément {"name": str, "path": str|None}. Le dernier
+    élément est le processus détecté lui-même.
+
+    sibling_interpreter_count : nombre d'AUTRES interpréteurs (cmd,
+    powershell, wscript...) actuellement lancés par le même parent —
+    signal de comportement anormal (cf. point 12 du document source).
+
+    Retourne {"process": int, "parent_child": int, "file": int,
+              "details": [{"rule": str, "points": int}, ...]}
+    — details sert directement au panneau "Pourquoi cette alerte vaut X ?"
+    """
+    if not ancestry:
+        return {"process": 0, "parent_child": 0, "file": 0, "details": []}
+
+    details = []
+    child = ancestry[-1]
+    child_name = (child.get("name") or "").lower()
+    child_path = child.get("path")
+
+    # 1. Réputation de base du processus détecté
+    process_score = PROCESS_BASE_SCORES.get(child_name, 0)
+    if process_score:
+        details.append({"rule": f"Réputation de base : {child_name}", "points": process_score})
+
+    parent_child_score = 0
+
+    # 2. Parent -> enfant : on parcourt TOUTE la chaîne (pas seulement les
+    # deux derniers maillons), pour capter une relation suspecte même si
+    # elle se trouve plus haut dans l'arbre (ex: Word → PowerShell, avec
+    # ensuite PowerShell → payload.exe en bout de chaîne). Chaque paire de
+    # la chaîne est distincte, donc les additionner ne fait pas de double
+    # comptage — ce sont bien plusieurs observations différentes.
+    for i in range(1, len(ancestry)):
+        p_name = (ancestry[i - 1].get("name") or "").lower()
+        c_name = (ancestry[i].get("name") or "").lower()
+        pair_score = PARENT_CHILD_RULES.get((p_name, c_name), 0)
+        if pair_score:
+            parent_child_score += pair_score
+            details.append({"rule": f"{p_name} \u2192 {c_name}", "points": pair_score})
+
+    # 3. Grand-parent -> parent -> enfant : idem, sur toute la chaîne.
+    for i in range(2, len(ancestry)):
+        gp_name = (ancestry[i - 2].get("name") or "").lower()
+        p_name = (ancestry[i - 1].get("name") or "").lower()
+        c_name = (ancestry[i].get("name") or "").lower()
+        for gp_set, p_set, c_set, bonus in CHAIN_RULES:
+            if gp_name in gp_set and p_name in p_set and c_name in c_set:
+                parent_child_score += bonus
+                details.append({
+                    "rule": f"Chaîne {gp_name} \u2192 {p_name} \u2192 {c_name}",
+                    "points": bonus,
+                })
+                break  # une seule règle de chaîne comptée par triplet
+
+    # 4. Plusieurs interpréteurs lancés par le même parent (comportement anormal)
+    if sibling_interpreter_count > 0:
+        parent_child_score += MULTI_INTERPRETER_BONUS
+        details.append({
+            "rule": f"Le parent a lancé {sibling_interpreter_count + 1} interpréteurs différents",
+            "points": MULTI_INTERPRETER_BONUS,
+        })
+
+    # 5. Profondeur de chaîne inhabituelle (petit bonus plafonné seulement,
+    # volontairement — une chaîne longue n'est qu'un indice faible à elle
+    # seule, cf. document source point 13)
+    depth_bonus = min(MAX_DEPTH_BONUS, max(0, len(ancestry) - 2) * DEPTH_BONUS_PER_LEVEL)
+    if depth_bonus:
+        parent_child_score += depth_bonus
+        details.append({"rule": f"Chaîne de {len(ancestry)} processus (profondeur inhabituelle)",
+                         "points": depth_bonus})
+
+    # 6. Emplacement du fichier exécuté
+    file_score = 0
+    path_pts, path_label = _path_signal(child_path)
+    if path_pts:
+        file_score += path_pts
+        details.append({"rule": f"Exécuté depuis {path_label}", "points": path_pts})
+
+    # 7. Réduction si emplacement système Windows connu — un SIGNAL de
+    # confiance, jamais une preuve d'innocence (cf. document source point 10)
+    if child_path and ("\\windows\\system32\\" in child_path.lower()
+                        or "\\windows\\syswow64\\" in child_path.lower()):
+        file_score += SIGNED_MS_DISCOUNT
+        details.append({"rule": "Emplacement système Windows connu", "points": SIGNED_MS_DISCOUNT})
+
+    return {
+        "process": process_score,
+        "parent_child": parent_child_score,
+        "file": file_score,
+        "details": details,
+    }
