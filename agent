@@ -60,6 +60,8 @@ import time
 import psutil
 import requests
 
+import process_scoring
+
 APP_NAME = "EDRAgent"
 REPORT_INTERVAL_SECONDS = 15
 IOC_REFRESH_EVERY_N_CYCLES = 4   # rafraîchit les IoC toutes les ~60s
@@ -571,6 +573,61 @@ def _execute_restore_file(quarantine_path, original_path):
 # ──────────────────────────────────────────────────────────
 # Détection : ancêtres de processus (pour la Process Timeline)
 # ──────────────────────────────────────────────────────────
+def build_scoring_ancestry(proc, max_levels=4):
+    """Construit la lignée (du plus ancien ancêtre vers le processus
+    détecté) au format attendu par process_scoring.score_ancestry() :
+    liste de {"name": str, "path": str|None}. Séparée de
+    build_process_ancestry() (qui produit les évènements de la Process
+    Timeline) car le format et l'usage sont différents."""
+    chain = []
+    try:
+        current = proc
+        for _ in range(max_levels):
+            try:
+                name = current.name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                break
+            try:
+                path = current.exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                path = None
+            chain.append({"name": name, "path": path})
+            try:
+                parent = current.parent()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                parent = None
+            if parent is None:
+                break
+            current = parent
+    except Exception:
+        pass
+    chain.reverse()
+    return chain
+
+
+def count_sibling_interpreters(proc):
+    """Combien d'AUTRES interpréteurs (cmd, powershell, wscript...) le
+    même parent a-t-il actuellement en cours d'exécution ? Signal de
+    comportement anormal (cf. process_scoring.py, point 12 du document
+    source : un parent qui lance plusieurs interpréteurs différents)."""
+    try:
+        parent = proc.parent()
+        if not parent:
+            return 0
+        count = 0
+        for sibling in parent.children():
+            if sibling.pid == proc.pid:
+                continue
+            try:
+                if sibling.name().lower() in process_scoring.INTERPRETER_NAMES:
+                    count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return count
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return 0
+
+
 def build_process_ancestry(proc, max_levels=4):
     chain = []
     try:
@@ -707,6 +764,13 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
         "parent_name": None, "detail": f"Exécutable : {file_path or 'inconnu'}",
     })
 
+    # Scoring de lignée complet (réputation, parent/grand-parent, chemin,
+    # interpréteurs frères) — capturé AVANT de tuer le processus, sinon
+    # proc.parent()/exe()/connections() ne répondent plus après terminate().
+    scoring_ancestry = build_scoring_ancestry(proc)
+    sibling_count = count_sibling_interpreters(proc)
+    ancestry_score = process_scoring.score_ancestry(scoring_ancestry, sibling_count)
+
     try:
         proc.terminate()
         proc.wait(timeout=3)
@@ -722,12 +786,10 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
 
     # Construction des signaux factuels pour le Risk Engine du serveur —
     # l'agent ne décide plus lui-même de la sévérité, il décrit juste ce
-    # qu'il a observé.
+    # qu'il a observé. process_scoring REMPLACE les catégories process/
+    # parent_child/file plutôt que de s'y ajouter (évite le double comptage).
     signals = {
-        "process_suspect": proc_name not in KNOWN_GOOD_PROCESSES,
-        "known_good_name": proc_name in KNOWN_GOOD_PROCESSES,
-        "file_unknown": True,  # ce point de code n'est atteint que sur détection -> fichier non catalogué comme sain
-        "ms_system_path": is_ms_system_path(file_path),
+        "process_scoring": ancestry_score,
         "persistence_path": is_persistence_path(file_path),
         "admin_or_system_user": is_admin_or_system_user(get_logged_in_user()),
         "server_asset": is_server_asset(cfg.get("agent_id")),
