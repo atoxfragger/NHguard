@@ -1292,7 +1292,9 @@ async function populateAlertDetailContent(alertId) {
   const alert = _alertsIndex[alertId];
   const agent = alert ? await getAgentInfo(alert.agent_id) : null;
   const breakdown = alert?.score_breakdown || {};
+  const scoreDetails = alert?.score_details || [];
   const hasBreakdown = Object.keys(breakdown).length > 0;
+  const hasDetails = scoreDetails.length > 0;
 
   const rows = [
     ['Composant', 'NHGuard'],
@@ -1333,8 +1335,24 @@ async function populateAlertDetailContent(alertId) {
     </div>
   ` : '';
 
+  const detailsHtml = hasDetails ? `
+    <div style="margin-bottom:14px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px 14px">
+      <div style="font-size:11px;color:var(--text2);font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px">
+        Analyse de la lignée de processus
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        ${scoreDetails.map(d => `
+          <tr>
+            <td style="padding:3px 10px 3px 0;color:var(--text2);font-family:var(--font-mono)">${d.rule}</td>
+            <td style="padding:3px 0;text-align:right;color:${d.points>0?'var(--red)':'var(--green)'};font-family:var(--font-mono);white-space:nowrap">${d.points>0?'+':''}${d.points}</td>
+          </tr>`).join('')}
+      </table>
+    </div>
+  ` : '';
+
   content.innerHTML = `
     ${breakdownHtml}
+    ${detailsHtml}
     <table style="width:100%;border-collapse:collapse">
       ${rows.map(([label, value]) => `
         <tr>
