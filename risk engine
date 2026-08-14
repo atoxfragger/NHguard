@@ -58,56 +58,67 @@ THRESHOLDS = [
 
 
 def compute_risk(signals: dict):
-    """Calcule le score de risque à partir d'un dict de signaux booléens.
+    """Calcule le score de risque à partir d'un dict de signaux.
 
-    Signaux attendus (tous optionnels, absent = False) :
+    Signaux booléens classiques (tous optionnels, absent = False) :
       process_suspect, known_good_name, ioc_hash_match, ioc_ip_match,
       ioc_cmdline_match, builtin_cmdline_match, lolbin_parent_child,
       unusual_parent, file_unknown, ms_system_path, persistence_path,
       admin_or_system_user, server_asset, known_bad_name
 
-    Retourne (score:int, breakdown:dict[label -> points], severity:str).
-    breakdown ne contient que les familles ayant contribué au score
-    (positivement ou négativement) — c'est ce qui s'affiche dans le
-    panneau "Pourquoi cette alerte vaut X ?" du dashboard.
+    Signal optionnel avancé :
+      process_scoring : dict {"process": int, "parent_child": int,
+        "file": int, "details": [{"rule": str, "points": int}, ...]}
+        produit par process_scoring.score_ancestry() côté agent, à partir
+        de la lignée complète (parent/grand-parent/chemin/réputation).
+        Quand il est fourni, il REMPLACE entièrement les catégories
+        process/parent_child/file calculées à partir des booléens
+        ci-dessus — jamais en plus — pour ne jamais compter deux fois
+        le même comportement observé (ex: "parent suspect" ne doit pas
+        être noté à la fois comme +25 fixe ET comme règle de chaîne).
 
-    Important : chaque famille répond à un signal d'entrée distinct.
-    Le bonus de corrélation compte le nombre de signaux d'ENTRÉE
-    indépendants déclenchés (pas le nombre de familles de score
-    obtenues en sortie) — sinon un seul fait (ex: fichier inconnu, qui
-    alimente à la fois "Fichier" et "Réputation") gonflerait
-    artificiellement la corrélation alors qu'une seule observation
-    réelle est en jeu.
+    Retourne (score:int, breakdown:dict[label -> points], severity:str,
+              details:list[{"rule": str, "points": int}]).
+    `details` n'est renseigné que si process_scoring était fourni — sinon
+    liste vide (le breakdown par famille reste la seule explication).
     """
     s = signals or {}
     raw = {}
+    details = []
 
-    # Process : signal dédié (pas dérivé de file_unknown, pour éviter
-    # qu'une seule observation ne compte double).
-    if s.get("known_good_name"):
-        raw["process"] = WEIGHTS["process_known_good"]
-    elif s.get("process_suspect"):
-        raw["process"] = WEIGHTS["process_suspect"]
+    process_scoring = s.get("process_scoring")
+
+    if process_scoring:
+        # Le scoring de lignée fait autorité sur ces 3 catégories.
+        raw["process"] = process_scoring.get("process", 0)
+        raw["parent_child"] = process_scoring.get("parent_child", 0)
+        raw["file"] = process_scoring.get("file", 0)
+        details = list(process_scoring.get("details", []))
     else:
-        raw["process"] = 0
+        # Repli : anciens signaux booléens simples (agents plus anciens,
+        # ou détections ne fournissant pas encore la lignée complète).
+        if s.get("known_good_name"):
+            raw["process"] = WEIGHTS["process_known_good"]
+        elif s.get("process_suspect"):
+            raw["process"] = WEIGHTS["process_suspect"]
+        else:
+            raw["process"] = 0
+
+        raw["parent_child"] = WEIGHTS["parent_suspect"] if (
+            s.get("lolbin_parent_child") or s.get("unusual_parent")
+        ) else 0
+
+        file_score = 0
+        if s.get("file_unknown"):
+            file_score += WEIGHTS["file_unknown"]
+        if s.get("ms_system_path"):
+            file_score += WEIGHTS["file_ms_signed_path"]
+        raw["file"] = file_score
 
     # Command line
     raw["command_line"] = WEIGHTS["cmdline_suspect"] if (
         s.get("ioc_cmdline_match") or s.get("builtin_cmdline_match")
     ) else 0
-
-    # Parent / Enfant
-    raw["parent_child"] = WEIGHTS["parent_suspect"] if (
-        s.get("lolbin_parent_child") or s.get("unusual_parent")
-    ) else 0
-
-    # Fichier
-    file_score = 0
-    if s.get("file_unknown"):
-        file_score += WEIGHTS["file_unknown"]
-    if s.get("ms_system_path"):
-        file_score += WEIGHTS["file_ms_signed_path"]
-    raw["file"] = file_score
 
     # Réseau
     raw["network"] = WEIGHTS["network_suspect"] if s.get("ioc_ip_match") else 0
@@ -132,21 +143,15 @@ def compute_risk(signals: dict):
     # Environnement
     raw["environment"] = WEIGHTS["environment_critical"] if s.get("server_asset") else 0
 
-    # Corrélation : compte les signaux d'ENTRÉE indépendants (pas les
-    # familles de score en sortie), pour ne récompenser qu'une vraie
-    # convergence de plusieurs observations distinctes.
-    primary_signals = [
-        bool(s.get("process_suspect")),
-        bool(s.get("ioc_cmdline_match") or s.get("builtin_cmdline_match")),
-        bool(s.get("lolbin_parent_child") or s.get("unusual_parent")),
-        bool(s.get("file_unknown")),
-        bool(s.get("ioc_ip_match")),
-        bool(s.get("persistence_path")),
-        bool(s.get("admin_or_system_user")),
-        bool(s.get("ioc_hash_match") or s.get("known_bad_name")),
-        bool(s.get("server_asset")),
-    ]
-    active_count = sum(1 for f in primary_signals if f)
+    # Corrélation : compte les FAMILLES DE SCORE final positives (hors
+    # réputation, dérivée de "fichier" — et hors corrélation elle-même),
+    # que la valeur vienne des booléens simples ou du scoring de lignée.
+    # Ça reste cohérent dans les deux cas car chaque famille ne peut être
+    # alimentée que par une seule observation réelle distincte.
+    active_count = sum(
+        1 for cat, pts in raw.items()
+        if cat not in ("reputation",) and pts > 0
+    )
     raw["correlation"] = WEIGHTS["correlation_bonus"] if active_count >= 3 else 0
 
     total = max(0, min(100, sum(raw.values())))
@@ -163,4 +168,4 @@ def compute_risk(signals: dict):
         if pts != 0
     }
 
-    return total, breakdown, severity
+    return total, breakdown, severity, details
