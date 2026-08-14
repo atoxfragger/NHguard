@@ -86,8 +86,8 @@ GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleuse
 # ──────────────────────────────────────────────────────────
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = '...'
-SMTP_PASSWORD = "..."
+SMTP_USER = ""
+SMTP_PASSWORD = ""
 SMTP_FROM_NAME = "NHGuard"
 
 
@@ -377,15 +377,16 @@ def agent_alert():
         # partir des signaux factuels envoyés par l'agent — la "severity"
         # suggérée par l'agent (ci-dessus) n'est qu'un repli si jamais
         # aucun signal n'est fourni (ancien agent, appel de test, etc.).
-        score, breakdown, severity = risk_engine.compute_risk(signals)
+        score, breakdown, severity, details = risk_engine.compute_risk(signals)
     else:
-        score, breakdown, severity = None, None, data["severity"]
+        score, breakdown, severity, details = None, None, data["severity"], None
 
     alert_id = db_data.create_alert(
         org_id=request.org_id,
         title=data["title"], description=data.get("description", ""),
         severity=severity, category=data.get("category", "autre"),
         agent_id=data["agent_id"], score=score, score_breakdown=breakdown,
+        score_details=details,
     )
     return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
 
