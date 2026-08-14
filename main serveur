@@ -37,6 +37,7 @@ from google.auth.transport import requests as google_requests
 import db_users
 import db_data
 import risk_engine
+import behaviour_engine
 
 app = Flask(__name__)
 CORS(app)
@@ -388,6 +389,29 @@ def agent_alert():
         agent_id=data["agent_id"], score=score, score_breakdown=breakdown,
         score_details=details,
     )
+
+    # Corrélation comportementale : regarde si cette alerte, combinée aux
+    # précédentes de la même machine sur la fenêtre glissante, dessine une
+    # chaîne d'attaque ou un comportement multi-tactiques plus large qu'un
+    # signal isolé (voir behaviour_engine.py). Ne s'exécute pas si une
+    # alerte comportementale a déjà été levée récemment pour cette machine
+    # (cooldown), pour ne pas spammer le dashboard pendant un même incident.
+    if not db_data.has_recent_behavioural_alert(
+        request.org_id, data["agent_id"], behaviour_engine.CORRELATION_COOLDOWN_MINUTES
+    ):
+        recent_alerts = db_data.get_recent_alerts_for_agent(
+            request.org_id, data["agent_id"], behaviour_engine.CORRELATION_WINDOW_MINUTES
+        )
+        verdict = behaviour_engine.evaluate(recent_alerts)
+        if verdict:
+            db_data.create_alert(
+                org_id=request.org_id,
+                title=verdict["title"], description=verdict["description"],
+                severity=verdict["severity"], category="comportemental",
+                agent_id=data["agent_id"], score=verdict["score"],
+                score_breakdown=None, score_details=verdict["details"],
+            )
+
     return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
 
 

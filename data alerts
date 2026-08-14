@@ -291,6 +291,51 @@ def ack_alert(org_id, alert_id):
         conn.execute("UPDATE alerts SET acknowledged = 1 WHERE id = ? AND org_id = ?", (alert_id, org_id))
 
 
+def get_recent_alerts_for_agent(org_id, agent_id, since_minutes):
+    """Alertes d'UNE machine sur les `since_minutes` dernières minutes,
+    triées du plus ancien au plus récent — entrée du Behaviour Engine
+    (behaviour_engine.evaluate), qui a besoin de l'historique complet
+    d'une machine pour corréler plusieurs alertes entre elles.
+
+    Tri par (timestamp, rowid) et pas seulement timestamp : la colonne
+    n'a qu'une précision à la seconde, donc plusieurs alertes créées la
+    même seconde (typiquement pendant une rafale — justement ce que ce
+    module cherche à détecter) auraient un ordre non déterministe sans
+    ce départage. `rowid` est la colonne implicite de SQLite qui reflète
+    l'ordre d'insertion, sans nécessiter de colonne ni migration dédiée."""
+    since = (datetime.utcnow() - timedelta(minutes=since_minutes)).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts WHERE org_id = ? AND agent_id = ? AND timestamp >= ? "
+            "ORDER BY timestamp, rowid",
+            (org_id, agent_id, since),
+        ).fetchall()
+        alerts = []
+        for r in rows:
+            a = dict(r)
+            try:
+                a["score_breakdown"] = json.loads(a["score_breakdown"]) if a.get("score_breakdown") else {}
+            except (TypeError, json.JSONDecodeError):
+                a["score_breakdown"] = {}
+            alerts.append(a)
+        return alerts
+
+
+def has_recent_behavioural_alert(org_id, agent_id, cooldown_minutes):
+    """True si une alerte comportementale (category='comportemental') a déjà
+    été créée pour cette machine il y a moins de `cooldown_minutes` — évite
+    de spammer le dashboard d'une nouvelle alerte de corrélation à chaque
+    alerte brute reçue pendant un même incident en cours."""
+    since = (datetime.utcnow() - timedelta(minutes=cooldown_minutes)).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM alerts WHERE org_id = ? AND agent_id = ? AND category = 'comportemental' "
+            "AND timestamp >= ? LIMIT 1",
+            (org_id, agent_id, since),
+        ).fetchone()
+        return row is not None
+
+
 # ──────────────────────────────────────────────────────────
 # Quarantaine (fichiers/processus bloqués)
 # ──────────────────────────────────────────────────────────

@@ -1,0 +1,257 @@
+"""
+behaviour_engine.py — Corrélation comportementale multi-alertes pour NHGuard.
+
+Le Risk Engine (risk_engine.py) évalue CHAQUE alerte isolément. Le
+Behaviour Engine regarde, lui, la SUITE des alertes d'UNE MÊME machine
+dans une fenêtre de temps glissante, pour détecter un enchaînement qui,
+alerte par alerte, peut sembler bénin ou de sévérité modérée, mais qui,
+mis bout à bout, correspond à une chaîne d'attaque réelle (ex : exécution
+d'un LOLBin, puis dépôt de persistance, puis connexion réseau suspecte —
+trois alertes "medium" qui, ensemble, valent une alerte "critical").
+
+Principe (inspiré de MITRE ATT&CK, simplifié à l'échelle du produit) :
+  - chaque alerte est rattachée à une ou plusieurs "tactiques" à partir
+    de son score_breakdown (Risk Engine, source de vérité) ou, à défaut,
+    de sa catégorie métier (repli pour agents anciens / alertes de test)
+  - une "chaîne d'attaque" est détectée quand une séquence de tactiques
+    connue apparaît, dans l'ordre, parmi les alertes de la fenêtre
+  - un "comportement multi-tactiques" est détecté quand suffisamment de
+    tactiques DISTINCTES apparaissent, même sans motif connu précis
+  - une "rafale" (beaucoup d'alertes en peu de temps) est un signal à
+    part, indépendant des tactiques en jeu — souvent le signe d'une
+    attaque automatisée/scriptée ou d'un outil bruyant
+
+Ce module ne DÉCIDE PAS quand s'exécuter ni comment persister son
+verdict (voir edr_server.py, appelant get_recent_alerts_for_agent()
+côté base puis evaluate() ici, avant de créer — ou non — une alerte de
+catégorie "comportemental"). Il reste une fonction pure, sans effet de
+bord, testable indépendamment du serveur — même logique de conception
+que risk_engine.py et process_scoring.py, et volontairement dépourvu de
+dépendances externes.
+"""
+
+from datetime import datetime, timedelta
+
+import risk_engine
+
+# ──────────────────────────────────────────────────────────
+# Fenêtres de temps et seuils — regroupés ici pour rester la seule source
+# de vérité (modifiable sans toucher à la logique de corrélation).
+# ──────────────────────────────────────────────────────────
+
+# Au-delà de cette fenêtre, deux alertes ne sont plus considérées comme
+# faisant partie du même épisode d'attaque.
+CORRELATION_WINDOW_MINUTES = 30
+
+# Nombre d'alertes dans une fenêtre courte pour parler de "rafale".
+BURST_ALERT_COUNT = 5
+BURST_WINDOW_MINUTES = 5
+
+# Nombre minimum de tactiques distinctes pour signaler un comportement
+# multi-tactiques, même en l'absence de motif connu précis.
+MIN_TACTICS_FOR_CHAIN = 3
+
+# Ne pas re-déclencher une alerte comportementale pour la même machine
+# plus d'une fois par période, même si de nouvelles alertes brutes
+# continuent d'arriver pendant l'incident (évite le bruit côté dashboard).
+CORRELATION_COOLDOWN_MINUTES = 15
+
+# En dessous de ce score final, l'épisode n'est pas jugé assez
+# significatif pour justifier une alerte comportementale à part entière
+# (le Risk Engine capte déjà le bruit de faible intensité alerte par
+# alerte) — aligné sur le seuil "high" du Risk Engine.
+MIN_SCORE_TO_ALERT = 60
+
+
+# ──────────────────────────────────────────────────────────
+# Association catégorie Risk Engine -> tactique MITRE ATT&CK simplifiée.
+# Une alerte peut relever de plusieurs tactiques à la fois si plusieurs
+# catégories de son score_breakdown sont non nulles (ex: "Parent / Enfant"
+# ET "Persistance" toutes les deux déclenchées par la même détection).
+# ──────────────────────────────────────────────────────────
+CATEGORY_TO_TACTIC = {
+    "Processus":         "Exécution",
+    "Ligne de commande": "Exécution",
+    "Parent / Enfant":   "Exécution",
+    "Fichier":           "Défense (évasion)",
+    "Réseau":            "Commande et contrôle",
+    "Persistance":       "Persistance",
+    "Identité":          "Élévation de privilèges",
+    "IOC":               "Impact confirmé",
+    "Réputation":        "Découverte",
+    "Environnement":     "Ciblage d'actif critique",
+}
+
+# Repli si l'alerte n'a pas de score_breakdown (agent ancien qui n'envoie
+# pas encore de signaux détaillés, ou alerte créée à la main/en test) :
+# on déduit une tactique approximative à partir de la catégorie métier
+# fournie directement par l'agent.
+FALLBACK_CATEGORY_TO_TACTIC = {
+    "process":     "Exécution",
+    "network":     "Commande et contrôle",
+    "persistence": "Persistance",
+    "file":        "Défense (évasion)",
+    "quarantine":  "Impact confirmé",
+}
+
+# Enchaînements de tactiques connus comme des schémas d'attaque classiques.
+# Chaque motif est une liste ORDONNÉE de tactiques : il matche si elles
+# apparaissent toutes dans la fenêtre, DANS CET ORDRE — mais pas forcément
+# consécutivement, ni exclusivement (d'autres alertes/tactiques peuvent
+# s'intercaler sans empêcher la détection).
+KNOWN_ATTACK_PATTERNS = [
+    (["Exécution", "Persistance", "Commande et contrôle"],
+     "Intrusion classique : exécution → persistance → commande et contrôle"),
+    (["Exécution", "Élévation de privilèges", "Persistance"],
+     "Prise de contrôle : exécution → élévation de privilèges → persistance"),
+    (["Découverte", "Commande et contrôle", "Impact confirmé"],
+     "Reconnaissance suivie d'une exfiltration ou d'un impact confirmé"),
+]
+
+BURST_POINTS = 25
+DISTINCT_TACTICS_POINTS = 30
+KNOWN_PATTERN_POINTS = 45
+
+
+def _tactics_for_alert(alert):
+    """Retourne l'ensemble des tactiques concernées par une alerte."""
+    tactics = set()
+    breakdown = alert.get("score_breakdown") or {}
+    for cat, pts in breakdown.items():
+        if pts and pts > 0 and cat in CATEGORY_TO_TACTIC:
+            tactics.add(CATEGORY_TO_TACTIC[cat])
+    if not tactics:
+        cat = (alert.get("category") or "").lower()
+        if cat in FALLBACK_CATEGORY_TO_TACTIC:
+            tactics.add(FALLBACK_CATEGORY_TO_TACTIC[cat])
+    return tactics
+
+
+def _parse_ts(ts):
+    try:
+        return datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pattern_present(pattern, ordered_tactics):
+    """True si `pattern` apparaît comme sous-séquence — pas forcément
+    contiguë — de `ordered_tactics`. Ex: [A, B, C] matche dans
+    [A, X, B, Y, C] mais pas dans [A, C, B].
+
+    Astuce : parcourir un itérateur avec `in` consomme les éléments
+    jusqu'à (et y compris) la valeur trouvée, donc chaque `step in it`
+    reprend exactement là où le précédent s'est arrêté."""
+    it = iter(ordered_tactics)
+    return all(step in it for step in pattern)
+
+
+def _severity_for_score(score):
+    """Réutilise les mêmes seuils que le Risk Engine (risk_engine.THRESHOLDS)
+    plutôt que d'en redéfinir de nouveaux ici — une seule échelle 0-100
+    pour tout NHGuard, cohérente entre alertes unitaires et comportementales."""
+    for threshold, label in risk_engine.THRESHOLDS:
+        if score >= threshold:
+            return label
+    return "low"
+
+
+def evaluate(alerts, now=None):
+    """alerts : alertes d'UNE SEULE machine (déjà filtrées par agent_id
+    côté appelant, voir db_data.get_recent_alerts_for_agent), dans
+    n'importe quel ordre — ce module se charge de les trier et de ne
+    garder que celles tombant dans la fenêtre de corrélation.
+
+    now : horodatage de référence (datetime), pour des tests déterministes.
+    Par défaut : l'instant présent.
+
+    Retourne None si rien d'assez significatif à signaler (cas normal,
+    largement majoritaire), sinon un dict :
+        {
+          "severity": "critical" | "high",
+          "score": int (0-100),
+          "title": str,
+          "description": str,
+          "details": [{"rule": str, "points": int}, ...],
+          "source_alert_ids": [str, ...],
+        }
+    prêt à être passé à db_data.create_alert(category="comportemental", ...).
+    """
+    if not alerts:
+        return None
+
+    now = now or datetime.utcnow()
+    window_start = now - timedelta(minutes=CORRELATION_WINDOW_MINUTES)
+
+    windowed = [a for a in alerts if (_parse_ts(a.get("timestamp")) or window_start) >= window_start]
+    if len(windowed) < 2:
+        return None  # une seule alerte ne peut jamais constituer, à elle seule, un "comportement"
+
+    windowed.sort(key=lambda a: a.get("timestamp") or "")
+    source_ids = [a["id"] for a in windowed if a.get("id")]
+    agent_label = windowed[-1].get("agent_id") or "?"
+
+    details = []
+
+    # 1. Rafale : beaucoup d'alertes dans une fenêtre courte, quelles que
+    #    soient les tactiques en jeu — souvent un outil automatisé/scripté.
+    burst_window_start = now - timedelta(minutes=BURST_WINDOW_MINUTES)
+    burst_count = sum(
+        1 for a in windowed
+        if (_parse_ts(a.get("timestamp")) or window_start) >= burst_window_start
+    )
+    burst = burst_count >= BURST_ALERT_COUNT
+    if burst:
+        details.append({
+            "rule": f"{burst_count} alertes en moins de {BURST_WINDOW_MINUTES} min (rafale)",
+            "points": BURST_POINTS,
+        })
+
+    # 2. Tactiques distinctes couvertes dans la fenêtre (ordre préservé,
+    #    nécessaire pour la détection de motifs à l'étape 3).
+    ordered_tactics = []
+    for a in windowed:
+        for t in sorted(_tactics_for_alert(a)):
+            ordered_tactics.append(t)
+    distinct_tactics = sorted(set(ordered_tactics))
+    if len(distinct_tactics) >= MIN_TACTICS_FOR_CHAIN:
+        details.append({
+            "rule": f"{len(distinct_tactics)} tactiques distinctes observées : {', '.join(distinct_tactics)}",
+            "points": DISTINCT_TACTICS_POINTS,
+        })
+
+    # 3. Motifs d'attaque connus (sous-séquences ordonnées de tactiques).
+    chain_matches = []
+    for pattern, label in KNOWN_ATTACK_PATTERNS:
+        if _pattern_present(pattern, ordered_tactics):
+            chain_matches.append(label)
+            details.append({"rule": label, "points": KNOWN_PATTERN_POINTS})
+
+    if not details:
+        return None  # rien d'assez significatif pour justifier une alerte comportementale
+
+    score = max(0, min(100, sum(d["points"] for d in details)))
+    severity = _severity_for_score(score)
+    if severity not in ("high", "critical") or score < MIN_SCORE_TO_ALERT:
+        return None  # le bruit de faible intensité reste géré alerte par alerte par le Risk Engine
+
+    if chain_matches:
+        title = f"Chaîne d'attaque détectée sur {agent_label}"
+    elif len(distinct_tactics) >= MIN_TACTICS_FOR_CHAIN:
+        title = f"Comportement multi-tactiques suspect sur {agent_label}"
+    else:
+        title = f"Rafale d'alertes suspecte sur {agent_label}"
+
+    description = (
+        f"{len(windowed)} alertes corrélées sur les {CORRELATION_WINDOW_MINUTES} dernières "
+        f"minutes ({', '.join(distinct_tactics) if distinct_tactics else 'tactique unique'})."
+    )
+
+    return {
+        "severity": severity,
+        "score": score,
+        "title": title,
+        "description": description,
+        "details": details,
+        "source_alert_ids": source_ids,
+    }
