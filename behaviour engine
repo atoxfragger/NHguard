@@ -94,6 +94,11 @@ FALLBACK_CATEGORY_TO_TACTIC = {
     "quarantine":  "Impact confirmé",
 }
 
+# Label affiché (risk_engine.CATEGORY_LABELS) -> clé interne, pour
+# retrouver la certitude intrinsèque de chaque famille de signal dans
+# risk_engine.CONFIDENCE_WEIGHTS (indexé par clé interne, pas par label).
+_LABEL_TO_CATEGORY = {label: cat for cat, label in risk_engine.CATEGORY_LABELS.items()}
+
 # Enchaînements de tactiques connus comme des schémas d'attaque classiques.
 # Chaque motif est une liste ORDONNÉE de tactiques : il matche si elles
 # apparaissent toutes dans la fenêtre, DANS CET ORDRE — mais pas forcément
@@ -146,6 +151,41 @@ def _pattern_present(pattern, ordered_tactics):
     return all(step in it for step in pattern)
 
 
+def _confidence(windowed):
+    """Confiance de la chaîne : même formule que risk_engine.compute_risk()
+    (moyenne des certitudes intrinsèques CONFIDENCE_WEIGHTS, pondérée par
+    les points de chaque famille de signal) — réutilisée telle quelle,
+    étendue sur TOUTES les alertes corrélées plutôt qu'une seule, pour une
+    seule notion de confiance cohérente dans tout NHGuard. Une chaîne
+    construite sur des signaux "Réputation" (le plus incertain de la
+    table, cf. risk_engine.py) hérite naturellement d'une confiance basse,
+    sans règle spéciale à écrire ici — c'est la Gestion UNKNOWN qui se
+    propage depuis le Risk Engine jusqu'au Behaviour Engine.
+
+    Une alerte sans score_breakdown exploitable (agent ancien, test)
+    contribue avec un poids nominal à confiance basse plutôt que d'être
+    ignorée — mieux vaut sous-estimer la confiance que la surestimer."""
+    weighted_sum, total_weight = 0.0, 0.0
+    for a in windowed:
+        breakdown = a.get("score_breakdown") or {}
+        contributed = False
+        for label, pts in breakdown.items():
+            if not pts or pts <= 0:
+                continue
+            cat = _LABEL_TO_CATEGORY.get(label)
+            conf = risk_engine.CONFIDENCE_WEIGHTS.get(cat, risk_engine.DEFAULT_CONFIDENCE)
+            weighted_sum += pts * conf
+            total_weight += pts
+            contributed = True
+        if not contributed:
+            weighted_sum += risk_engine.BASELINE_CONFIDENCE_NO_SIGNAL
+            total_weight += 1
+
+    if total_weight == 0:
+        return risk_engine.BASELINE_CONFIDENCE_NO_SIGNAL
+    return round(max(0.0, min(1.0, weighted_sum / total_weight)), 2)
+
+
 def _severity_for_score(score):
     """Réutilise les mêmes seuils que le Risk Engine (risk_engine.THRESHOLDS)
     plutôt que d'en redéfinir de nouveaux ici — une seule échelle 0-100
@@ -170,6 +210,7 @@ def evaluate(alerts, now=None):
         {
           "severity": "critical" | "high",
           "score": int (0-100),
+          "confidence": float (0-1),
           "title": str,
           "description": str,
           "details": [{"rule": str, "points": int}, ...],
@@ -232,6 +273,15 @@ def evaluate(alerts, now=None):
 
     score = max(0, min(100, sum(d["points"] for d in details)))
     severity = _severity_for_score(score)
+    confidence = _confidence(windowed)
+
+    # Même garde-fou que risk_engine.compute_risk() : une chaîne à
+    # confiance insuffisante ne peut pas s'afficher au-dessus du plafond,
+    # même si son score chiffré atteindrait "critical".
+    if confidence < risk_engine.CONFIDENCE_GATE_THRESHOLD:
+        if risk_engine.SEVERITY_ORDER.index(severity) > risk_engine.SEVERITY_ORDER.index(risk_engine.CONFIDENCE_GATE_MAX_SEVERITY):
+            severity = risk_engine.CONFIDENCE_GATE_MAX_SEVERITY
+
     if severity not in ("high", "critical") or score < MIN_SCORE_TO_ALERT:
         return None  # le bruit de faible intensité reste géré alerte par alerte par le Risk Engine
 
@@ -250,6 +300,7 @@ def evaluate(alerts, now=None):
     return {
         "severity": severity,
         "score": score,
+        "confidence": confidence,
         "title": title,
         "description": description,
         "details": details,

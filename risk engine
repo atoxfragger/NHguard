@@ -12,13 +12,56 @@ d'une sévérité arbitraire. Cette centralisation permet de :
   - faire évoluer la logique de scoring dans le temps sans casser la
     compatibilité avec les agents déjà déployés
 
-Le module est volontairement dépourvu de dépendances externes.
+── Threat vs Impact : deux questions différentes ──
+"Ce processus est-il malveillant ?" (THREAT) et "si oui, quelle est la
+gravité des conséquences ?" (IMPACT) sont deux questions indépendantes.
+Un même comportement suspect n'a pas la même urgence sur un poste de
+stagiaire que sur un contrôleur de domaine — pourtant, avant cette
+version, "admin_or_system_user" et "server_asset" étaient mélangés dans
+LA MÊME somme que les preuves de malveillance (process/cmdline/parent...),
+ce qui n'a jamais de sens : être administrateur système ne rend PAS un
+évènement plus suspect en soi, ça rend seulement ses conséquences pires
+s'il l'est vraiment. Ce module sépare donc explicitement :
+  - threat_score  : preuve de malveillance (les catégories historiques)
+  - impact_score  : gravité si la menace est confirmée (identité, actif)
+et ne les recombine qu'à la toute fin, avec l'impact plafonné pour ne
+jamais, à lui seul, transformer un signal faible en alerte critique
+(même philosophie que behaviour_engine.py et temporal_correlator.py :
+un facteur secondaire modère, il ne déclenche jamais seul).
+
+── Confidence : à quel point peut-on FAIRE CONFIANCE au score ? ──
+Toutes les preuves ne se valent pas : une correspondance de hash IoC est
+quasi certaine, une heuristique de chemin de fichier est un indice faible.
+Le score seul ne dit rien de cette différence — deux alertes à 65 points
+peuvent être l'une un hash confirmé (certitude), l'autre un empilement de
+signaux heuristiques faibles (incertitude). CONFIDENCE_WEIGHTS attribue à
+chaque famille de signal sa certitude intrinsèque ; la confiance finale
+est la moyenne de ces certitudes, PONDÉRÉE par la contribution de chaque
+famille au score (une famille qui pèse plus dans le score a plus de poids
+dans la confiance). Une confiance basse RÉDUIT le score final (jamais en
+dessous de CONFIDENCE_FLOOR_FACTOR du score brut) et plafonne la sévérité
+affichée — voir compute_risk() — pour éviter la fatigue d'alertes
+"critiques" qui reposent en réalité sur des indices fragiles.
+
+── Gestion UNKNOWN ──
+"Inconnu" n'est PAS synonyme de "connu et sain" — c'est une absence
+d'information, pas une preuve d'innocence. process_scoring.py distingue
+maintenant explicitement les processus catalogués ("known") des autres
+("unknown") sans changer leur score (voir sa documentation : pénaliser
+tout binaire non catalogué produirait des faux positifs massifs). Ici,
+ce statut n'affecte QUE la confiance : un score construit sur un
+processus jamais catalogué mérite une confiance légèrement plus basse
+qu'un score construit sur un nom reconnu — voir REPUTATION_UNKNOWN_PENALTY.
+
+Le module reste volontairement dépourvu de dépendances externes.
 """
 
 # ──────────────────────────────────────────────────────────
-# Poids par signal, organisés par famille (catégorie du Risk Engine)
+# Poids THREAT (preuve de malveillance), organisés par famille (catégorie
+# du Risk Engine). Ne PAS y mêler des signaux d'impact (identité, actif) —
+# voir IMPACT_WEIGHTS ci-dessous et l'en-tête du module.
 # ──────────────────────────────────────────────────────────
-WEIGHTS = {
+THREAT_WEIGHTS = {
     "process_suspect":     20,   # nom de processus inconnu / non répertorié comme sain
     "process_known_good":  -20,  # processus reconnu comme légitime (réduit le bruit)
     "cmdline_suspect":     20,   # motif suspect dans la ligne de commande (IoC ou intégré)
@@ -27,12 +70,24 @@ WEIGHTS = {
     "file_ms_signed_path": -30,  # chemin sous un dossier système Windows connu
     "network_suspect":     20,   # connexion vers une IP figurant dans les IoC
     "persistence":         30,   # dépôt dans un emplacement de démarrage automatique
-    "identity_privileged": 10,   # exécuté par un compte administrateur/système
     "ioc_confirmed":       40,   # correspondance directe avec un IoC (hash, nom connu)
     "reputation_low":      10,   # fichier inconnu, non signé, hors dossier système
-    "environment_critical": 10,  # machine considérée comme un actif sensible (serveur...)
-    "correlation_bonus":   15,   # plusieurs familles de signaux déclenchées simultanément
+    "correlation_bonus":   15,   # plusieurs familles de signaux THREAT déclenchées simultanément
 }
+
+# Poids IMPACT (gravité SI la menace est confirmée) — jamais additionnés
+# au threat_score, seulement combinés à la toute fin (voir compute_risk).
+IMPACT_WEIGHTS = {
+    "identity_privileged": 10,   # exécuté par un compte administrateur/système
+    "environment_critical": 10,  # machine considérée comme un actif sensible (serveur...)
+}
+
+# Catégories concernées par chaque axe (mêmes clés que le dict `raw` interne).
+THREAT_CATEGORIES = {
+    "process", "command_line", "parent_child", "file", "network",
+    "persistence", "ioc", "reputation", "correlation",
+}
+IMPACT_CATEGORIES = {"identity", "environment"}
 
 CATEGORY_LABELS = {
     "process":      "Processus",
@@ -48,6 +103,38 @@ CATEGORY_LABELS = {
     "correlation":  "Corrélation",
 }
 
+# Certitude intrinsèque de chaque famille de signal THREAT (0-1) — sert au
+# calcul de confidence, jamais au score lui-même. Une correspondance IoC
+# directe (hash/nom connu) est quasi certaine ; un indice de réputation
+# faible (fichier inconnu, hors dossier système) est le signal le plus
+# fragile du lot, volontairement le plus bas de la table.
+CONFIDENCE_WEIGHTS = {
+    "process":      0.55,  # heuristique de réputation de nom, contournable
+    "command_line": 0.70,  # motif de ligne de commande, assez spécifique
+    "parent_child": 0.65,  # heuristique LOLBin, solide mais pas une preuve directe
+    "file":         0.50,  # heuristique de chemin, faible seule
+    "network":      0.75,  # correspondance IoC IP, assez fiable
+    "persistence":  0.80,  # fait constaté (chemin de démarrage), difficile à contester
+    "ioc":          0.95,  # correspondance directe hash/nom connu, quasi certaine
+    "reputation":   0.35,  # absence de catalogage — le signal le plus fragile
+    "correlation":  0.60,  # plusieurs signaux faibles ensemble : ni fort ni négligeable
+}
+DEFAULT_CONFIDENCE = 0.5
+BASELINE_CONFIDENCE_NO_SIGNAL = 0.3  # aucune catégorie THREAT active : rien à évaluer
+
+# "Inconnu" (process_scoring.reputation == "unknown") dégrade légèrement
+# la confiance déjà calculée, en plus du poids "reputation" ci-dessus —
+# voir l'en-tête du module, section Gestion UNKNOWN.
+REPUTATION_UNKNOWN_PENALTY = 0.85
+
+# La confiance ne peut jamais faire descendre le score final en dessous de
+# cette fraction du threat_score brut (elle MODÈRE, ne supprime jamais) ;
+# l'impact ne peut jamais contribuer plus que IMPACT_CONTRIBUTION de son
+# propre score — même logique "le contexte renforce, il ne crée jamais
+# la détection à lui seul" que dans behaviour_engine.py / temporal_correlator.py.
+CONFIDENCE_FLOOR_FACTOR = 0.6
+IMPACT_CONTRIBUTION = 0.15
+
 # Seuils de sévérité à partir du score final (0-100)
 THRESHOLDS = [
     (80, "critical"),
@@ -55,10 +142,26 @@ THRESHOLDS = [
     (30, "medium"),
     (0,  "low"),
 ]
+SEVERITY_ORDER = ["low", "medium", "high", "critical"]
+
+# En dessous de cette confiance, la sévérité affichée est plafonnée — une
+# alerte "critique" ne devrait jamais reposer uniquement sur des indices
+# fragiles (cf. en-tête du module). Le score chiffré, lui, reste honnête
+# (déjà réduit par CONFIDENCE_FLOOR_FACTOR) : seul l'ÉTIQUETTE de sévérité
+# est plafonnée, pour éviter la fatigue d'alertes "critiques" non fiables.
+CONFIDENCE_GATE_THRESHOLD = 0.5
+CONFIDENCE_GATE_MAX_SEVERITY = "medium"
+
+
+def _severity_for_score(score):
+    for threshold, label in THRESHOLDS:
+        if score >= threshold:
+            return label
+    return "low"
 
 
 def compute_risk(signals: dict):
-    """Calcule le score de risque à partir d'un dict de signaux.
+    """Calcule le risque à partir d'un dict de signaux.
 
     Signaux booléens classiques (tous optionnels, absent = False) :
       process_suspect, known_good_name, ioc_hash_match, ioc_ip_match,
@@ -68,23 +171,29 @@ def compute_risk(signals: dict):
 
     Signal optionnel avancé :
       process_scoring : dict {"process": int, "parent_child": int,
-        "file": int, "details": [{"rule": str, "points": int}, ...]}
-        produit par process_scoring.score_ancestry() côté agent, à partir
-        de la lignée complète (parent/grand-parent/chemin/réputation).
-        Quand il est fourni, il REMPLACE entièrement les catégories
-        process/parent_child/file calculées à partir des booléens
-        ci-dessus — jamais en plus — pour ne jamais compter deux fois
-        le même comportement observé (ex: "parent suspect" ne doit pas
-        être noté à la fois comme +25 fixe ET comme règle de chaîne).
+        "file": int, "reputation": "known"|"unknown",
+        "details": [{"rule": str, "points": int}, ...]}
+        produit par process_scoring.score_ancestry() côté agent. Quand il
+        est fourni, il REMPLACE entièrement les catégories process/
+        parent_child/file calculées à partir des booléens ci-dessus —
+        jamais en plus — pour ne jamais compter deux fois le même
+        comportement observé.
 
-    Retourne (score:int, breakdown:dict[label -> points], severity:str,
-              details:list[{"rule": str, "points": int}]).
-    `details` n'est renseigné que si process_scoring était fourni — sinon
-    liste vide (le breakdown par famille reste la seule explication).
+    Retourne un dict :
+      {
+        "score": int (0-100),               # score final, threat+impact+confidence combinés
+        "severity": "critical"|"high"|"medium"|"low",
+        "breakdown": {label -> points},      # détail par famille, toutes catégories confondues
+        "details": [{"rule": str, "points": int}, ...],  # règles individuelles (process_scoring)
+        "confidence": float (0-1),           # certitude de la classification
+        "threat_score": int (0-100),         # preuve de malveillance, seule
+        "impact_score": int (0-100),         # gravité si confirmé, seule
+      }
     """
     s = signals or {}
     raw = {}
     details = []
+    reputation_unknown = False
 
     process_scoring = s.get("process_scoring")
 
@@ -94,73 +203,103 @@ def compute_risk(signals: dict):
         raw["parent_child"] = process_scoring.get("parent_child", 0)
         raw["file"] = process_scoring.get("file", 0)
         details = list(process_scoring.get("details", []))
+        reputation_unknown = process_scoring.get("reputation") == "unknown"
     else:
         # Repli : anciens signaux booléens simples (agents plus anciens,
         # ou détections ne fournissant pas encore la lignée complète).
         if s.get("known_good_name"):
-            raw["process"] = WEIGHTS["process_known_good"]
+            raw["process"] = THREAT_WEIGHTS["process_known_good"]
         elif s.get("process_suspect"):
-            raw["process"] = WEIGHTS["process_suspect"]
+            raw["process"] = THREAT_WEIGHTS["process_suspect"]
         else:
             raw["process"] = 0
 
-        raw["parent_child"] = WEIGHTS["parent_suspect"] if (
+        raw["parent_child"] = THREAT_WEIGHTS["parent_suspect"] if (
             s.get("lolbin_parent_child") or s.get("unusual_parent")
         ) else 0
 
         file_score = 0
         if s.get("file_unknown"):
-            file_score += WEIGHTS["file_unknown"]
+            file_score += THREAT_WEIGHTS["file_unknown"]
         if s.get("ms_system_path"):
-            file_score += WEIGHTS["file_ms_signed_path"]
+            file_score += THREAT_WEIGHTS["file_ms_signed_path"]
         raw["file"] = file_score
 
     # Command line
-    raw["command_line"] = WEIGHTS["cmdline_suspect"] if (
+    raw["command_line"] = THREAT_WEIGHTS["cmdline_suspect"] if (
         s.get("ioc_cmdline_match") or s.get("builtin_cmdline_match")
     ) else 0
 
     # Réseau
-    raw["network"] = WEIGHTS["network_suspect"] if s.get("ioc_ip_match") else 0
+    raw["network"] = THREAT_WEIGHTS["network_suspect"] if s.get("ioc_ip_match") else 0
 
     # Persistance
-    raw["persistence"] = WEIGHTS["persistence"] if s.get("persistence_path") else 0
-
-    # Identité
-    raw["identity"] = WEIGHTS["identity_privileged"] if s.get("admin_or_system_user") else 0
+    raw["persistence"] = THREAT_WEIGHTS["persistence"] if s.get("persistence_path") else 0
 
     # IOC
-    raw["ioc"] = WEIGHTS["ioc_confirmed"] if (
+    raw["ioc"] = THREAT_WEIGHTS["ioc_confirmed"] if (
         s.get("ioc_hash_match") or s.get("known_bad_name")
     ) else 0
 
     # Réputation (dérivée de file_unknown — même observation que "Fichier",
     # donc volontairement EXCLUE du décompte de corrélation ci-dessous)
-    raw["reputation"] = WEIGHTS["reputation_low"] if (
+    raw["reputation"] = THREAT_WEIGHTS["reputation_low"] if (
         s.get("file_unknown") and not s.get("ms_system_path") and not s.get("known_good_name")
     ) else 0
 
-    # Environnement
-    raw["environment"] = WEIGHTS["environment_critical"] if s.get("server_asset") else 0
+    # Identité / Environnement : axe IMPACT, jamais mélangé au threat_score.
+    raw["identity"] = IMPACT_WEIGHTS["identity_privileged"] if s.get("admin_or_system_user") else 0
+    raw["environment"] = IMPACT_WEIGHTS["environment_critical"] if s.get("server_asset") else 0
 
-    # Corrélation : compte les FAMILLES DE SCORE final positives (hors
-    # réputation, dérivée de "fichier" — et hors corrélation elle-même),
-    # que la valeur vienne des booléens simples ou du scoring de lignée.
-    # Ça reste cohérent dans les deux cas car chaque famille ne peut être
+    # Corrélation : compte les FAMILLES THREAT (jamais impact) dont le
+    # score final est positif (hors réputation, dérivée de "fichier" — et
+    # hors corrélation elle-même). Ça reste cohérent que la valeur vienne
+    # des booléens simples ou du scoring de lignée, chaque famille n'étant
     # alimentée que par une seule observation réelle distincte.
-    active_count = sum(
-        1 for cat, pts in raw.items()
-        if cat not in ("reputation",) and pts > 0
+    active_threat_count = sum(
+        1 for cat in THREAT_CATEGORIES
+        if cat not in ("reputation", "correlation") and raw.get(cat, 0) > 0
     )
-    raw["correlation"] = WEIGHTS["correlation_bonus"] if active_count >= 3 else 0
+    raw["correlation"] = THREAT_WEIGHTS["correlation_bonus"] if active_threat_count >= 3 else 0
 
-    total = max(0, min(100, sum(raw.values())))
+    # ── Threat / Impact, séparés ──
+    threat_raw = {cat: pts for cat, pts in raw.items() if cat in THREAT_CATEGORIES}
+    impact_raw = {cat: pts for cat, pts in raw.items() if cat in IMPACT_CATEGORIES}
 
-    severity = "low"
-    for threshold, label in THRESHOLDS:
-        if total >= threshold:
-            severity = label
-            break
+    threat_score = max(0, min(100, sum(threat_raw.values())))
+    # Poids impact max = 20 (10+10) ; ×5 pour ramener sur une échelle 0-100
+    # comparable au threat_score dans le dashboard.
+    impact_score = max(0, min(100, sum(impact_raw.values()) * 5))
+
+    # ── Confidence : moyenne des certitudes des familles THREAT actives,
+    # pondérée par leur contribution au score (une famille qui pèse plus
+    # a plus de poids dans la confiance finale). ──
+    active_threat = [(cat, pts) for cat, pts in threat_raw.items() if pts > 0]
+    if active_threat:
+        weighted = sum(pts * CONFIDENCE_WEIGHTS.get(cat, DEFAULT_CONFIDENCE) for cat, pts in active_threat)
+        confidence = weighted / sum(pts for _, pts in active_threat)
+    else:
+        confidence = BASELINE_CONFIDENCE_NO_SIGNAL
+
+    if reputation_unknown:
+        confidence *= REPUTATION_UNKNOWN_PENALTY
+    confidence = round(max(0.0, min(1.0, confidence)), 2)
+
+    # ── Score final : le threat domine, la confiance le module (jamais en
+    # dessous de CONFIDENCE_FLOOR_FACTOR du threat brut), l'impact ajoute
+    # au plus IMPACT_CONTRIBUTION de sa propre échelle. ──
+    blended = (
+        threat_score * (CONFIDENCE_FLOOR_FACTOR + (1 - CONFIDENCE_FLOOR_FACTOR) * confidence)
+        + impact_score * IMPACT_CONTRIBUTION
+    )
+    score = max(0, min(100, round(blended)))
+    severity = _severity_for_score(score)
+
+    # Une alerte à confiance insuffisante ne peut pas s'afficher au-dessus
+    # de CONFIDENCE_GATE_MAX_SEVERITY, quel que soit le score chiffré.
+    if confidence < CONFIDENCE_GATE_THRESHOLD:
+        if SEVERITY_ORDER.index(severity) > SEVERITY_ORDER.index(CONFIDENCE_GATE_MAX_SEVERITY):
+            severity = CONFIDENCE_GATE_MAX_SEVERITY
 
     breakdown = {
         CATEGORY_LABELS[cat]: pts
@@ -168,4 +307,12 @@ def compute_risk(signals: dict):
         if pts != 0
     }
 
-    return total, breakdown, severity, details
+    return {
+        "score": score,
+        "severity": severity,
+        "breakdown": breakdown,
+        "details": details,
+        "confidence": confidence,
+        "threat_score": threat_score,
+        "impact_score": impact_score,
+    }

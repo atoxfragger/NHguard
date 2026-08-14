@@ -1,0 +1,95 @@
+"""
+process_tree.py — Reconstruction de l'arbre de processus pour NHGuard.
+
+process_events (voir db_data.py) est une liste PLATE de lignes — une par
+(pid, type d'évènement) observé pendant une détection. C'est suffisant
+pour une simple liste chronologique, mais pas pour montrer d'un coup
+d'œil une vraie hiérarchie parent → enfant → petit-enfant, ce qu'un
+produit commercialisable doit offrir : un analyste doit voir
+immédiatement "payload.exe a été lancé PAR powershell.exe, lui-même
+lancé PAR winword.exe", pas reconstituer ça mentalement à partir d'une
+liste plate.
+
+Ce module ne fait qu'une chose : transformer cette liste en une forêt de
+nœuds {pid, name, events, children}. Fonction pure, sans dépendance
+externe, comme le reste des moteurs NHGuard — et volontairement séparée
+du regroupement par union-find de temporal_correlator.py : ce dernier
+sert à SCOPER une corrélation (peu importe la forme exacte de l'arbre),
+celui-ci sert à AFFICHER une hiérarchie exacte pour le dashboard — deux
+besoins différents, pas de raison de les coupler.
+"""
+
+
+def build(events):
+    """events : lignes process_events (pid, parent_pid, process_name,
+    parent_name, event_type, detail, timestamp, id), dans n'importe quel
+    ordre, normalement toutes rattachées à une même alerte ou un même
+    arbre de processus.
+
+    Retourne une FORÊT (liste de nœuds racines — généralement un seul,
+    sauf si plusieurs lignées disjointes ont été capturées) :
+        {"pid": int, "name": str, "children": [même structure, ...],
+         "events": [{"type": str, "detail": str|None, "timestamp": str,
+                      "id": str|None}, ...]}
+
+    Chaque pid n'apparaît qu'UNE seule fois, même s'il porte plusieurs
+    lignes d'évènements (ex: "process" + "file" + "network" pour le même
+    processus détecté) : leurs évènements sont fusionnés dans le même
+    nœud plutôt que de créer un nœud par ligne.
+    """
+    if not events:
+        return []
+
+    nodes = {}      # pid -> nœud
+    parent_of = {}  # pid -> premier parent_pid connu pour ce pid
+
+    for e in events:
+        pid = e.get("pid")
+        if pid is None:
+            continue  # évènement non rattachable à un nœud (pas observé avec les données actuelles de l'agent)
+
+        node = nodes.setdefault(pid, {"pid": pid, "name": e.get("process_name") or "?", "children": [], "events": []})
+        # Le nom porté par l'évènement "process" (la lignée elle-même) fait
+        # autorité sur celui d'un évènement "file"/"network" annexe, qui
+        # peut porter un nom moins fiable (ex: titre de l'alerte en repli).
+        if e.get("event_type") == "process" and e.get("process_name"):
+            node["name"] = e["process_name"]
+
+        node["events"].append({
+            "type": e.get("event_type"), "detail": e.get("detail"),
+            "timestamp": e.get("timestamp"), "id": e.get("id"),
+        })
+
+        ppid = e.get("parent_pid")
+        if ppid is not None and pid not in parent_of:
+            parent_of[pid] = ppid
+
+    for node in nodes.values():
+        node["events"].sort(key=lambda ev: ev.get("timestamp") or "")
+
+    roots = []
+    for pid, node in nodes.items():
+        ppid = parent_of.get(pid)
+        # Rattaché à son parent seulement si ce parent a lui-même été
+        # observé dans ce lot d'évènements — sinon (lignée tronquée par
+        # max_levels côté agent, ou pas de parent) le nœud est une racine.
+        # `ppid != pid` écarte une boucle triviale (jamais vue en pratique,
+        # un processus ne peut pas être son propre parent) sans faire de
+        # détection de cycle générale, inutile vu la provenance des données.
+        if ppid is not None and ppid in nodes and ppid != pid:
+            nodes[ppid]["children"].append(node)
+        else:
+            roots.append(node)
+
+    def _first_ts(node):
+        return node["events"][0]["timestamp"] if node["events"] else ""
+
+    def _sort_children(node):
+        node["children"].sort(key=_first_ts)
+        for child in node["children"]:
+            _sort_children(child)
+
+    for root in roots:
+        _sort_children(root)
+    roots.sort(key=_first_ts)
+    return roots

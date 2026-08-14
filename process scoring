@@ -109,14 +109,26 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
     — details sert directement au panneau "Pourquoi cette alerte vaut X ?"
     """
     if not ancestry:
-        return {"process": 0, "parent_child": 0, "file": 0, "details": []}
+        return {"process": 0, "parent_child": 0, "file": 0, "details": [], "reputation": "unknown"}
 
     details = []
     child = ancestry[-1]
     child_name = (child.get("name") or "").lower()
     child_path = child.get("path")
 
-    # 1. Réputation de base du processus détecté
+    # 1. Réputation de base du processus détecté. On distingue explicitement
+    # "connu" (présent dans PROCESS_BASE_SCORES, bon ou mauvais signe) de
+    # "inconnu" (jamais catalogué) — les DEUX donnent aujourd'hui 0 point
+    # par défaut (get(..., 0)), volontairement : la base ne couvrant qu'une
+    # poignée de noms, pénaliser tout binaire non catalogué produirait des
+    # faux positifs massifs sur des logiciels légitimes jamais listés ici.
+    # Mais "inconnu" n'est PAS la même situation que "connu et sain" pour
+    # autant : c'est une absence d'information, pas une preuve d'innocence.
+    # Ce champ "reputation" ne change donc aucun score ici — il alimente
+    # uniquement le calcul de CONFIANCE du Risk Engine (risk_engine.py) :
+    # un score bâti sur des signaux "inconnus" mérite une confiance plus
+    # basse qu'un score bâti sur une correspondance connue/confirmée.
+    reputation = "known" if child_name in PROCESS_BASE_SCORES else "unknown"
     process_score = PROCESS_BASE_SCORES.get(child_name, 0)
     if process_score:
         details.append({"rule": f"Réputation de base : {child_name}", "points": process_score})
@@ -187,4 +199,5 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
         "parent_child": parent_child_score,
         "file": file_score,
         "details": details,
+        "reputation": reputation,
     }

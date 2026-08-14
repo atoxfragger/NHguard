@@ -76,7 +76,11 @@ def init_db():
                 agent_id       TEXT,
                 timestamp      TEXT NOT NULL,
                 acknowledged   INTEGER NOT NULL DEFAULT 0,
-                is_demo        INTEGER NOT NULL DEFAULT 0
+                is_demo        INTEGER NOT NULL DEFAULT 0,
+                confidence     REAL,             -- certitude 0-1 (Risk Engine / Behaviour Engine)
+                threat_score   INTEGER,          -- preuve de malveillance seule, avant impact (Risk Engine)
+                impact_score   INTEGER,          -- gravité si confirmé, seule (Risk Engine)
+                is_correlation INTEGER NOT NULL DEFAULT 0  -- alerte dérivée (Behaviour/Temporal Engine), pas une détection brute
             )
         """)
         conn.execute("""
@@ -175,6 +179,20 @@ def init_db():
             conn.execute("ALTER TABLE alerts ADD COLUMN score_breakdown TEXT")
         if "score_details" not in alert_cols:
             conn.execute("ALTER TABLE alerts ADD COLUMN score_details TEXT")
+        if "confidence" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN confidence REAL")
+        if "threat_score" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN threat_score INTEGER")
+        if "impact_score" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN impact_score INTEGER")
+        if "is_correlation" not in alert_cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN is_correlation INTEGER NOT NULL DEFAULT 0")
+            # Rétro-marque les alertes déjà créées par les moteurs de corrélation,
+            # pour que les stats existantes ne les comptent pas rétroactivement
+            # comme des détections brutes (voir get_stats).
+            conn.execute(
+                "UPDATE alerts SET is_correlation = 1 WHERE category IN ('comportemental', 'chaine_temporelle')"
+            )
 
 
 # Score de repli si le Risk Engine n'a pas pu être appliqué (ex: alerte créée
@@ -269,18 +287,28 @@ def get_alerts(org_id, severity=None, limit=50):
 
 
 def create_alert(org_id, title, description, severity, category, agent_id, is_demo=False,
-                  score=None, score_breakdown=None, score_details=None):
+                  score=None, score_breakdown=None, score_details=None,
+                  confidence=None, threat_score=None, impact_score=None, is_correlation=False):
+    """is_correlation=True identifie une alerte PRODUITE par un moteur de
+    corrélation (Behaviour Engine, Temporal Correlator) plutôt qu'une
+    détection brute de l'agent — voir get_stats(), qui exclut ces alertes
+    du décompte principal par sévérité pour ne pas compter deux fois le
+    même incident (une fois comme détections brutes, une fois comme la
+    chaîne qui les relie)."""
     alert_id = str(uuid.uuid4())
     if score is None:
         score = SEVERITY_SCORE.get(severity, 1)
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details, category, agent_id, timestamp, acknowledged, is_demo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details,
+                                 category, agent_id, timestamp, acknowledged, is_demo,
+                                 confidence, threat_score, impact_score, is_correlation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
         """, (alert_id, org_id, title, description, severity, score,
               json.dumps(score_breakdown) if score_breakdown else None,
               json.dumps(score_details) if score_details else None,
-              category, agent_id, datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0))
+              category, agent_id, datetime.utcnow().isoformat(timespec="seconds"), 1 if is_demo else 0,
+              confidence, threat_score, impact_score, 1 if is_correlation else 0))
     return alert_id
 
 
@@ -579,13 +607,27 @@ def get_stats(org_id):
             "SELECT COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0", (org_id,)
         ).fetchone()["c"]
 
+        # is_correlation = 0 seulement : une chaîne détectée par le Behaviour
+        # Engine ou le Temporal Correlator décrit un incident DÉJÀ compté par
+        # les alertes brutes qui la composent — la compter aussi ici
+        # doublerait artificiellement le volume d'incidents affiché (voir
+        # create_alert() et le point "anti-double-counting" du produit).
         by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for row in conn.execute(
-            "SELECT severity, COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0 GROUP BY severity",
+            "SELECT severity, COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0 "
+            "AND is_correlation = 0 GROUP BY severity",
             (org_id,),
         ):
             if row["severity"] in by_sev:
                 by_sev[row["severity"]] = row["c"]
+
+        # Alertes de corrélation non acquittées, comptées À PART : ce sont
+        # des INSIGHTS ("ces alertes forment une chaîne"), pas de nouveaux
+        # incidents à additionner aux compteurs de sévérité ci-dessus.
+        correlation_insights = conn.execute(
+            "SELECT COUNT(*) c FROM alerts WHERE org_id = ? AND acknowledged = 0 AND is_correlation = 1",
+            (org_id,),
+        ).fetchone()["c"]
 
         by_cat = {}
         for row in conn.execute(
@@ -615,6 +657,7 @@ def get_stats(org_id):
             "total": total, "non_acquittees": non_ack,
             "critical": by_sev["critical"], "high": by_sev["high"],
             "medium": by_sev["medium"], "low": by_sev["low"],
+            "correlation_insights": correlation_insights,
             "par_categorie": by_cat, "last_24h": last_24h,
             "agents_total": agents_total, "agents_actifs": agents_actifs,
             "agents_reels": agents_reels, "a_des_donnees_demo": a_des_donnees_demo,
@@ -733,9 +776,15 @@ def seed_demo(org_id):
         ],
         sibling_interpreter_count=1,
     )
+    # "high" utilise une VRAIE corrélation de plusieurs familles de menace
+    # (process + ligne de commande + parent suspect), pas seulement un
+    # contexte privilégié — depuis la séparation Threat/Impact du Risk
+    # Engine, l'identité seule ne peut plus, à elle seule, faire basculer
+    # une alerte dans une bande de sévérité supérieure (voir risk_engine.py).
     DEMO_SIGNALS_BY_SEVERITY = {
         "critical": {"process_scoring": demo_ancestry_score, "ioc_hash_match": True, "ioc_ip_match": True},
-        "high":     {"process_suspect": True, "ioc_cmdline_match": True, "admin_or_system_user": True},
+        "high":     {"process_suspect": True, "ioc_cmdline_match": True, "unusual_parent": True,
+                     "admin_or_system_user": True},
         "medium":   {"process_suspect": True, "ioc_cmdline_match": True},
         "low":      {"file_unknown": True},
     }
@@ -749,15 +798,17 @@ def seed_demo(org_id):
             # La sévérité stockée est TOUJOURS celle calculée par le moteur
             # à partir des signaux — jamais choisie à la main, exactement
             # comme pour une vraie détection remontée par un agent.
-            score, breakdown, computed_sev, details = risk_engine.compute_risk(
-                DEMO_SIGNALS_BY_SEVERITY.get(target_sev, {})
-            )
-            demo_alerts_info.append((alert_id, computed_sev, chosen_agent, cat))
+            risk = risk_engine.compute_risk(DEMO_SIGNALS_BY_SEVERITY.get(target_sev, {}))
+            demo_alerts_info.append((alert_id, risk["severity"], chosen_agent, cat))
             conn.execute("""
-                INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details, category, agent_id, timestamp, acknowledged, is_demo)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """, (alert_id, org_id, title, desc, computed_sev, score, json.dumps(breakdown), json.dumps(details), cat,
-                  chosen_agent, ts, acknowledged))
+                INSERT INTO alerts (id, org_id, title, description, severity, score, score_breakdown, score_details,
+                                     category, agent_id, timestamp, acknowledged, is_demo,
+                                     confidence, threat_score, impact_score, is_correlation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0)
+            """, (alert_id, org_id, title, desc, risk["severity"], risk["score"],
+                  json.dumps(risk["breakdown"]), json.dumps(risk["details"]), cat,
+                  chosen_agent, ts, acknowledged,
+                  risk["confidence"], risk["threat_score"], risk["impact_score"]))
 
     # Arbre d'exécution de démo, rattaché à TOUTES les alertes critiques/hautes
     # (pas seulement la première) — pour que la Process Timeline montre

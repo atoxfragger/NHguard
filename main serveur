@@ -39,6 +39,7 @@ import db_data
 import risk_engine
 import behaviour_engine
 import temporal_correlator
+import process_tree
 
 app = Flask(__name__)
 CORS(app)
@@ -375,20 +376,25 @@ def agent_alert():
 
     signals = data.get("signals")
     if signals:
-        # Source de vérité : le Risk Engine calcule score ET sévérité à
-        # partir des signaux factuels envoyés par l'agent — la "severity"
-        # suggérée par l'agent (ci-dessus) n'est qu'un repli si jamais
-        # aucun signal n'est fourni (ancien agent, appel de test, etc.).
-        score, breakdown, severity, details = risk_engine.compute_risk(signals)
+        # Source de vérité : le Risk Engine calcule score, sévérité,
+        # confiance et threat/impact à partir des signaux factuels envoyés
+        # par l'agent — la "severity" suggérée par l'agent (ci-dessus)
+        # n'est qu'un repli si jamais aucun signal n'est fourni (ancien
+        # agent, appel de test, etc.).
+        risk = risk_engine.compute_risk(signals)
+        score, breakdown, severity, details = risk["score"], risk["breakdown"], risk["severity"], risk["details"]
+        confidence, threat_score, impact_score = risk["confidence"], risk["threat_score"], risk["impact_score"]
     else:
         score, breakdown, severity, details = None, None, data["severity"], None
+        confidence, threat_score, impact_score = None, None, None
 
     alert_id = db_data.create_alert(
         org_id=request.org_id,
         title=data["title"], description=data.get("description", ""),
         severity=severity, category=data.get("category", "autre"),
         agent_id=data["agent_id"], score=score, score_breakdown=breakdown,
-        score_details=details,
+        score_details=details, confidence=confidence,
+        threat_score=threat_score, impact_score=impact_score,
     )
 
     # Corrélation comportementale : regarde si cette alerte, combinée aux
@@ -411,6 +417,7 @@ def agent_alert():
                 severity=verdict["severity"], category="comportemental",
                 agent_id=data["agent_id"], score=verdict["score"],
                 score_breakdown=None, score_details=verdict["details"],
+                confidence=verdict["confidence"], is_correlation=True,
             )
 
     return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
@@ -495,6 +502,7 @@ def agent_process_events():
                     "rule": f"Motif {best['pattern_id']} — {best['pattern_name']}",
                     "points": score,
                 }],
+                confidence=best["confidence"], is_correlation=True,
             )
 
     return jsonify({"success": True, "count": len(events)}), 201
@@ -692,7 +700,11 @@ def ack(alert_id):
 @app.route("/api/alerts/<alert_id>/process-tree", methods=["GET"])
 @require_auth
 def alert_process_tree(alert_id):
-    return jsonify(db_data.get_process_tree(request.org_id, alert_id))
+    events = db_data.get_process_tree(request.org_id, alert_id)
+    # "events" (liste plate, inchangée) reste exposé pour compatibilité ;
+    # "tree" (hiérarchie reconstruite, voir process_tree.py) est ce que le
+    # dashboard affiche désormais dans la Process Timeline.
+    return jsonify({"events": events, "tree": process_tree.build(events)})
 
 
 @app.route("/api/investigate/aggregations", methods=["GET"])
