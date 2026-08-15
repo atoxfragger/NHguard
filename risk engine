@@ -55,6 +55,35 @@ la dégrade légèrement (REPUTATION_UNKNOWN_PENALTY) — "signed" est traité
 comme "known" (pas de pénalité), une signature vérifiée étant un signal
 de confiance à part entière, indépendant du catalogue de noms.
 
+── Rareté / prévalence / historique ──
+Un binaire jamais vu ailleurs dans l'organisation, ou vu sur une seule
+machine alors qu'il y en a plusieurs, mérite un peu plus d'attention —
+pas une accusation (un outil interne légitime est aussi "rare" qu'un
+malware sur mesure), donc un poids modeste (voir THREAT_WEIGHTS
+["rarity_new"/"rarity_rare"]) et une confiance intrinsèque BASSE (voir
+CONFIDENCE_WEIGHTS["rarity"], au même niveau que "reputation" — la
+famille de signal la plus fragile de la table). Alimenté par le signal
+optionnel `process_intelligence` (voir db_data.get_process_intelligence,
+calculé depuis l'historique des process_start de toute l'organisation),
+absent = aucun effet, jamais une supposition.
+
+── Où vivent Behavior et Temporal dans cette pile ── (Risk Engine v2)
+Ce module ne fusionne PAS directement les signaux Behaviour Engine /
+Temporal Correlator dans son propre calcul : au moment où compute_risk()
+tourne (à la création d'UNE alerte), la corrélation comportementale n'a
+pas encore eu lieu — voir edr_server.py:_run_behavior_correlation(),
+qui s'exécute APRÈS, une fois l'alerte (et ses process_events/évènements
+associés) enregistrés. Restructurer l'ordre pour que compute_risk()
+"connaisse" par avance le résultat d'une corrélation qui dépend de
+l'alerte qu'il est en train de créer introduirait une dépendance
+circulaire. La fusion existe bel et bien, mais UN ÉTAGE AU-DESSUS :
+behaviour_engine.evaluate() réutilise déjà CONFIDENCE_WEIGHTS,
+THRESHOLDS et le même gate confiance→sévérité que ce module (voir sa
+docstring), donc le verdict comportemental final reste sur LA MÊME
+échelle 0-100 et le même sens de "confidence" que le Risk Engine —
+une seule pile de scoring cohérente, en deux temps plutôt qu'en un seul
+calcul monolithique.
+
 Le module reste volontairement dépourvu de dépendances externes.
 """
 
@@ -75,6 +104,8 @@ THREAT_WEIGHTS = {
     "ioc_confirmed":       40,   # correspondance directe avec un IoC (hash, nom connu)
     "reputation_low":      10,   # fichier inconnu, non signé, hors dossier système
     "correlation_bonus":   15,   # plusieurs familles de signaux THREAT déclenchées simultanément
+    "rarity_new":          10,   # jamais observé nulle part ailleurs dans l'organisation
+    "rarity_rare":          6,   # observé, mais sur une seule machine parmi plusieurs
 }
 
 # Poids IMPACT (gravité SI la menace est confirmée) — jamais additionnés
@@ -87,7 +118,7 @@ IMPACT_WEIGHTS = {
 # Catégories concernées par chaque axe (mêmes clés que le dict `raw` interne).
 THREAT_CATEGORIES = {
     "process", "command_line", "parent_child", "file", "network",
-    "persistence", "ioc", "reputation", "correlation",
+    "persistence", "ioc", "reputation", "correlation", "rarity",
 }
 IMPACT_CATEGORIES = {"identity", "environment"}
 
@@ -103,13 +134,15 @@ CATEGORY_LABELS = {
     "reputation":   "Réputation",
     "environment":  "Environnement",
     "correlation":  "Corrélation",
+    "rarity":       "Rareté",
 }
 
 # Certitude intrinsèque de chaque famille de signal THREAT (0-1) — sert au
 # calcul de confidence, jamais au score lui-même. Une correspondance IoC
-# directe (hash/nom connu) est quasi certaine ; un indice de réputation
-# faible (fichier inconnu, hors dossier système) est le signal le plus
-# fragile du lot, volontairement le plus bas de la table.
+# directe (hash/nom connu) est quasi certaine ; la rareté (jamais vue
+# ailleurs dans l'organisation) est le signal le plus fragile du lot,
+# volontairement le plus bas de la table — la nouveauté seule ne dit rien
+# de la malveillance.
 CONFIDENCE_WEIGHTS = {
     "process":      0.55,  # heuristique de réputation de nom, contournable
     "command_line": 0.70,  # motif de ligne de commande, assez spécifique
@@ -118,8 +151,9 @@ CONFIDENCE_WEIGHTS = {
     "network":      0.75,  # correspondance IoC IP, assez fiable
     "persistence":  0.80,  # fait constaté (chemin de démarrage), difficile à contester
     "ioc":          0.95,  # correspondance directe hash/nom connu, quasi certaine
-    "reputation":   0.35,  # absence de catalogage — le signal le plus fragile
+    "reputation":   0.35,  # absence de catalogage
     "correlation":  0.60,  # plusieurs signaux faibles ensemble : ni fort ni négligeable
+    "rarity":       0.30,  # nouveauté/rareté seule — un outil interne légitime l'est aussi
 }
 DEFAULT_CONFIDENCE = 0.5
 BASELINE_CONFIDENCE_NO_SIGNAL = 0.3  # aucune catégorie THREAT active : rien à évaluer
@@ -189,7 +223,16 @@ def compute_risk(signals: dict):
         dans AUCUN calcul de score ni de confiance ici : il est recopié
         tel quel dans le résultat pour traçabilité/affichage (dashboard),
         car la plupart de ces champs (utilisateur, session, âge, ligne de
-        commande, hash) ne sont pas encore transformés en règles de score.
+        commande) ne sont pas encore transformés en règles de score.
+
+    Signal optionnel avancé :
+      process_intelligence : dict produit par
+        db_data.get_process_intelligence(org_id, hash) côté serveur (PAS
+        par ce module, qui reste sans dépendance externe — c'est
+        l'appelant, edr_server.py, qui fait la recherche en base à partir
+        de process_scoring["context"]["hash"] et la passe ici). Alimente
+        la catégorie "rarity" (voir en-tête du module) via ses champs
+        "is_new"/"is_rare" — absent ou {} : aucun effet, pas de supposition.
 
     Retourne un dict :
       {
@@ -262,18 +305,31 @@ def compute_risk(signals: dict):
         s.get("file_unknown") and not s.get("ms_system_path") and not s.get("known_good_name")
     ) else 0
 
+    # Rareté — voir en-tête du module. "is_new" prime sur "is_rare" (elif,
+    # pas deux ajouts) : un binaire jamais vu nulle part est déjà, par
+    # construction, vu sur une seule machine — les compter séparément
+    # doublerait la même observation.
+    process_intelligence = s.get("process_intelligence") or {}
+    if process_intelligence.get("is_new"):
+        raw["rarity"] = THREAT_WEIGHTS["rarity_new"]
+    elif process_intelligence.get("is_rare"):
+        raw["rarity"] = THREAT_WEIGHTS["rarity_rare"]
+    else:
+        raw["rarity"] = 0
+
     # Identité / Environnement : axe IMPACT, jamais mélangé au threat_score.
     raw["identity"] = IMPACT_WEIGHTS["identity_privileged"] if s.get("admin_or_system_user") else 0
     raw["environment"] = IMPACT_WEIGHTS["environment_critical"] if s.get("server_asset") else 0
 
     # Corrélation : compte les FAMILLES THREAT (jamais impact) dont le
-    # score final est positif (hors réputation, dérivée de "fichier" — et
-    # hors corrélation elle-même). Ça reste cohérent que la valeur vienne
-    # des booléens simples ou du scoring de lignée, chaque famille n'étant
-    # alimentée que par une seule observation réelle distincte.
+    # score final est positif (hors réputation et rareté, des signaux
+    # dérivés plutôt que des observations comportementales indépendantes —
+    # et hors corrélation elle-même). Ça reste cohérent que la valeur
+    # vienne des booléens simples ou du scoring de lignée, chaque famille
+    # n'étant alimentée que par une seule observation réelle distincte.
     active_threat_count = sum(
         1 for cat in THREAT_CATEGORIES
-        if cat not in ("reputation", "correlation") and raw.get(cat, 0) > 0
+        if cat not in ("reputation", "rarity", "correlation") and raw.get(cat, 0) > 0
     )
     raw["correlation"] = THREAT_WEIGHTS["correlation_bonus"] if active_threat_count >= 3 else 0
 

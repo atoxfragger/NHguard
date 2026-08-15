@@ -1302,6 +1302,10 @@ def collect_process_events(cfg):
             actor={"pid": pid, "ppid": ppid, "user": user},
             data={
                 "process": name, "path": path, "command_line": cmdline,
+                # hash_file() est mis en cache par chemin (voir sa
+                # définition) : un même binaire relancé plusieurs fois ne
+                # coûte le calcul du hash qu'une seule fois.
+                "hash": hash_file(path) if path else None,
                 "integrity_level": get_integrity_level(pid),
                 "session_id": get_session_id(pid),
                 "signed": is_authenticode_signed(path) if path else None,
@@ -1376,6 +1380,29 @@ def collect_network_events(cfg):
             event_type, cfg["agent_id"], event_queue.next_seq(),
             actor={"pid": pid, "ppid": None, "user": None},
             data=data, os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    # Symétrique de la boucle ci-dessus : une connexion qui a disparu de
+    # l'instantané s'est fermée — utile pour mesurer une durée de session
+    # réseau, ou repérer une connexion anormalement longue/courte.
+    for key in _prev_connections - current_keys:
+        pid, src_ip, src_port, dst_ip, dst_port = key
+        proc_name = None
+        if pid:
+            try:
+                proc_name = psutil.Process(pid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        ev = event_schema.make_event(
+            "network_disconnect", cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": pid, "ppid": None, "user": None},
+            data={
+                "process": proc_name,
+                "source_ip": src_ip, "source_port": src_port,
+                "destination_ip": dst_ip, "destination_port": dst_port,
+            },
+            os_name=platform.system(),
         )
         event_queue.enqueue(ev)
 

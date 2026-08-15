@@ -466,6 +466,15 @@ def agent_alert():
 
     signals = data.get("signals")
     if signals:
+        # Rareté/prévalence/historique (Risk Engine v2, voir sa docstring
+        # "Où vivent Behavior et Temporal dans cette pile") : recherche en
+        # base AVANT d'appeler compute_risk(), qui reste volontairement
+        # sans dépendance à db_data — c'est ici, côté serveur, que le hash
+        # remonté par process_scoring est traduit en historique réel.
+        file_hash = ((signals.get("process_scoring") or {}).get("context") or {}).get("hash")
+        if file_hash:
+            signals["process_intelligence"] = db_data.get_process_intelligence(request.org_id, file_hash)
+
         # Source de vérité : le Risk Engine calcule score, sévérité,
         # confiance et threat/impact à partir des signaux factuels envoyés
         # par l'agent — la "severity" suggérée par l'agent (ci-dessus)

@@ -76,6 +76,7 @@ def init_db():
                 pid            INTEGER,
                 ppid           INTEGER,
                 actor_user     TEXT,
+                hash           TEXT,            -- SHA-256 (process_start uniquement) — voir get_process_intelligence
                 data           TEXT NOT NULL,   -- JSON: le champ "data" de l'évènement (voir event_schema.py)
                 timestamp      TEXT NOT NULL,
                 received_at    TEXT NOT NULL,
@@ -167,6 +168,14 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_agent_ts ON events(org_id, agent_id, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_type ON events(org_id, event_type)")
+
+        # AVANT l'index sur hash : sur une base existant déjà avant l'ajout
+        # de cette colonne, CREATE TABLE IF NOT EXISTS ne l'aurait pas créée
+        # (table déjà existante = no-op) — l'index planterait sinon.
+        events_cols = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+        if "hash" not in events_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN hash TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_hash ON events(org_id, hash)")
 
         # Migration douce : si edr_data.db existait déjà avant l'ajout de ces
         # colonnes, on les ajoute sans effacer les données existantes.
@@ -621,15 +630,62 @@ def create_raw_events(org_id, events):
     with get_connection() as conn:
         for ev in events:
             actor = ev.get("actor") or {}
+            data = ev.get("data") or {}
             conn.execute("""
                 INSERT OR IGNORE INTO events
                     (event_id, org_id, agent_id, seq, event_type, priority, pid, ppid,
-                     actor_user, data, timestamp, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     actor_user, hash, data, timestamp, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (ev["event_id"], org_id, ev["host"]["id"], ev.get("seq"),
                   ev["event"]["type"], ev["event"].get("priority"),
                   actor.get("pid"), actor.get("ppid"), actor.get("user"),
-                  json.dumps(ev.get("data") or {}), ev["timestamp"], now))
+                  data.get("hash"), json.dumps(data), ev["timestamp"], now))
+
+
+def get_process_intelligence(org_id, file_hash):
+    """Rareté / prévalence / historique d'un binaire (par SHA-256) au sein
+    d'une organisation — calculé à la volée depuis la table `events`
+    (process_start uniquement, seul type qui porte un hash) plutôt que
+    maintenu à part dans une table de synthèse : plus simple, aucun
+    risque de désynchronisation, et à l'échelle de ce produit (SQLite,
+    requête indexée sur idx_events_org_hash) le coût est négligeable.
+
+    Retourne None si file_hash est vide (rien à chercher). Sinon :
+      {
+        "seen_count": int,        -- nb de démarrages observés (tous hôtes)
+        "distinct_hosts": int,    -- nb de machines DISTINCTES l'ayant exécuté
+        "total_hosts": int,       -- nb total de machines de l'organisation
+        "prevalence": float,      -- distinct_hosts / total_hosts (0-1)
+        "first_seen": str|None,   -- horodatage de la première observation
+        "last_seen": str|None,
+        "is_new": bool,           -- jamais vu avant CETTE observation (seen_count <= 1)
+        "is_rare": bool,          -- vu sur une seule machine alors qu'il y en a plusieurs
+      }
+    """
+    if not file_hash:
+        return None
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS seen_count, COUNT(DISTINCT agent_id) AS distinct_hosts,
+                   MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen
+            FROM events WHERE org_id = ? AND event_type = 'process_start' AND hash = ?
+        """, (org_id, file_hash)).fetchone()
+        total_hosts = conn.execute(
+            "SELECT COUNT(*) c FROM agents WHERE org_id = ?", (org_id,)
+        ).fetchone()["c"]
+
+        seen_count = row["seen_count"] or 0
+        distinct_hosts = row["distinct_hosts"] or 0
+        return {
+            "seen_count": seen_count,
+            "distinct_hosts": distinct_hosts,
+            "total_hosts": total_hosts,
+            "prevalence": round(distinct_hosts / total_hosts, 3) if total_hosts else 0.0,
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+            "is_new": seen_count <= 1,
+            "is_rare": total_hosts >= 3 and distinct_hosts == 1,
+        }
 
 
 def get_recent_raw_events_for_agent(org_id, agent_id, since_minutes, event_types=None):

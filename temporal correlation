@@ -107,6 +107,15 @@ TEMPORAL_PATTERNS = [
 # resserrée.
 RAW_TEMPORAL_PATTERNS = [
     {
+        # ⚠️ Même limite que RTC-004 : persistence_created (voir
+        # edr_agent.py:collect_persistence_events/collect_service_events/
+        # collect_scheduled_task_events) ne porte pas de pid — la
+        # différence d'instantané registre/service/tâche ne dit pas QUEL
+        # processus a fait le changement. Ce motif ne peut donc matcher
+        # qu'en repli "machine entière" lui aussi, jamais au niveau
+        # "process_tree" — voir RTC-005 pour un motif à 4 étapes conçu
+        # pour matcher au niveau process_tree (uniquement des types
+        # d'évènements qui portent un pid).
         "id": "RTC-001",
         "name": "Exécution suivie d'une persistance puis d'une connexion réseau",
         "steps": ["process_start", "persistence_created", "network_connect"],
@@ -136,6 +145,20 @@ RAW_TEMPORAL_PATTERNS = [
         "name": "Fichier déposé puis exécuté (dépôt puis lancement)",
         "steps": ["file_create", "process_start"],
         "window_seconds": 5 * 60,
+    },
+    {
+        # Motif à 4 étapes conçu pour démontrer une chaîne PROFONDE qui
+        # matche réellement au niveau "process_tree" (pas seulement en
+        # repli) : les 4 types d'évènements portent tous un pid
+        # (contrairement à file_create/persistence_created ci-dessus), et
+        # process_start du second maillon porte le parent_pid du premier
+        # — de quoi relier tout l'arbre par union-find (voir
+        # _process_tree_groups). Narratif : un processus en lance un
+        # second, qui se connecte puis coupe la connexion.
+        "id": "RTC-005",
+        "name": "Processus parent → enfant qui se connecte puis coupe la connexion",
+        "steps": ["process_start", "process_start", "network_connect", "network_disconnect"],
+        "window_seconds": 8 * 60,
     },
 ]
 

@@ -50,6 +50,7 @@ EVENT_PRIORITY = {
     # P1 — important : ce qui alimente le plus directement la détection
     "process_start":         "P1",
     "network_connect":       "P1",
+    "network_disconnect":    "P2",
     "persistence_created":   "P1",
     "persistence_modified":  "P1",
     # P2 — normal
