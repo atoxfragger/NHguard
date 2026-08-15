@@ -74,6 +74,8 @@ EVENT_PRIORITY = {
     "server_connected":      "P0",
     "server_disconnected":   "P0",
     "queue_full":            "P0",
+    "agent_unexpected_exit": "P0",  # émis par edr_watchdog.py, pas par l'agent lui-même
+    "agent_tampered":        "P0",
 }
 DEFAULT_PRIORITY = "P2"
 

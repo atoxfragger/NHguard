@@ -111,6 +111,15 @@ def user_exists(email: str) -> bool:
     return get_user_by_email(email) is not None
 
 
+def get_users_by_org(org_id):
+    """Tous les utilisateurs d'une organisation — sert notamment au
+    Policy Engine pour l'action "notify_only" (envoi d'un email à
+    toute l'organisation quand une politique de notification matche)."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM users WHERE org_id = ?", (org_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
 def create_user(org_id, email, first_name, last_name, password_hash,
                  role="member", google_account=False):
     with get_connection() as conn:

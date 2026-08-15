@@ -1,0 +1,59 @@
+"""
+policy_engine.py — Décide automatiquement d'une réponse à partir du
+risque déjà calculé par le Risk Engine / Behaviour Engine, selon des
+politiques configurables PAR ORGANISATION (voir db_data.py: table
+policies, et edr_server.py pour le point d'appel).
+
+Avant ce module, TOUTE réponse (isoler une machine, tuer un processus,
+mettre un fichier en quarantaine) exigeait un clic humain dans le
+dashboard — même une alerte critique à 95% de confiance restait sans
+action tant que personne n'avait regardé l'écran. C'est la différence
+entre "on détecte" et "on protège" : ce module transforme un score en
+action SANS attendre un analyste, uniquement quand l'organisation a
+explicitement configuré qu'elle le souhaite (aucune politique par
+défaut — une organisation qui n'a rien configuré garde le comportement
+100% manuel d'avant).
+
+── Périmètre v1 volontairement prudent ──
+Une seule action isolante possible : "isolate" (couper le réseau de la
+machine entière). PAS de kill_process ni de quarantine_file automatiques
+en v1 : ces deux actions ont besoin d'un pid ou d'un chemin de fichier
+PRÉCIS, qu'une alerte ne porte pas toujours de façon fiable jusqu'ici —
+mieux vaut ne pas cibler automatiquement la mauvaise chose. "isolate" ne
+cible que ce qui est TOUJOURS connu avec certitude pour une alerte :
+l'agent_id de la machine — une action nettement plus sûre à déclencher
+sans supervision humaine, et réversible (voir /api/agents/<id>/unisolate,
+déjà existant).
+L'autre action, "notify_only", ne touche à rien sur la machine : elle
+envoie un email à l'organisation, pour les cas où l'organisation veut
+être alertée plus vite qu'en consultant le dashboard, sans déclencher
+d'action automatique.
+"""
+
+SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def evaluate_policies(policies, context):
+    """policies : politiques déjà filtrées "enabled" pour l'organisation
+    (voir db_data.get_policies). context : {"severity", "confidence",
+    "category", "agent_id"}.
+
+    Retourne la liste des politiques dont TOUTES les conditions
+    renseignées sont satisfaites (ET logique) — un champ de politique
+    laissé à None ne filtre rien, une politique entièrement vide matche
+    donc TOUT (utile pour un "notify_only" générique sur toute alerte)."""
+    matched = []
+    ctx_rank = SEVERITY_RANK.get(context.get("severity"), -1)
+    ctx_confidence = context.get("confidence")
+    ctx_category = context.get("category")
+
+    for p in policies:
+        if p.get("min_severity") and ctx_rank < SEVERITY_RANK.get(p["min_severity"], 99):
+            continue
+        if p.get("min_confidence") is not None:
+            if ctx_confidence is None or ctx_confidence < p["min_confidence"]:
+                continue
+        if p.get("category") and p["category"] != ctx_category:
+            continue
+        matched.append(p)
+    return matched

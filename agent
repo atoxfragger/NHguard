@@ -75,9 +75,12 @@ import process_scoring
 
 APP_NAME = "EDRAgent"
 REPORT_INTERVAL_SECONDS = 15
-IOC_REFRESH_EVERY_N_CYCLES = 4   # rafraîchit les IoC toutes les ~60s
+IOC_REFRESH_EVERY_N_CYCLES = 4     # rafraîchit les IoC toutes les ~60s
+UPDATE_CHECK_EVERY_N_CYCLES = 40   # vérifie une nouvelle version toutes les ~10 min
 
 FIREWALL_RULE_PREFIX = "NHGuard-Isolation"
+
+AGENT_VERSION = "1.0.0"  # relevé après chaque build ; comparé à agent_release côté serveur
 
 
 def _redirect_output_if_no_console():
@@ -172,6 +175,35 @@ def quarantine_dir():
     folder = os.path.join(base, APP_NAME, "Quarantine")
     os.makedirs(folder, exist_ok=True)
     return folder
+
+
+def harden_folder_permissions(path):
+    """Restreint l'accès à un dossier sensible (file locale, quarantaine,
+    config) à SYSTEM et Administrateurs — retire les permissions
+    héritées par défaut, qui incluent souvent le compte utilisateur
+    courant. Protège contre un malware s'exécutant SANS privilège élevé
+    (le cas le plus courant en pratique) qui tenterait de supprimer la
+    file locale ou les fichiers en quarantaine pour effacer ses traces.
+
+    N'arrête PAS un attaquant qui a DÉJÀ les mêmes privilèges que
+    l'agent (SYSTEM/Administrateur) — aucune protection en espace
+    utilisateur ne le peut (voir GRACEFUL_SHUTDOWN_MARKER plus haut sur
+    la même limite face à `taskkill /F`). Utilise le SID générique
+    *S-1-5-32-544 pour "Administrateurs" plutôt que le nom du groupe,
+    qui varie selon la langue du système (Administrators/Administrateurs/...)."""
+    if not _IS_WINDOWS or not os.path.isdir(path):
+        return False
+    try:
+        subprocess.run(
+            ["icacls", path, "/inheritance:r",
+             "/grant:r", "SYSTEM:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
+             "/T", "/C"],
+            capture_output=True, text=True, timeout=15, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 def load_config():
@@ -927,6 +959,8 @@ if _IS_WINDOWS:
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    _kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
     _kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     _kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
 
@@ -990,6 +1024,227 @@ if _IS_WINDOWS:
 
     _wintrust.WinVerifyTrust.restype = ctypes.c_long
     _wintrust.WinVerifyTrust.argtypes = [wintypes.HWND, ctypes.POINTER(_GUID), ctypes.c_void_p]
+
+
+# ──────────────────────────────────────────────────────────
+# Coopération avec edr_watchdog.py — voir sa docstring pour le principe
+# général. `taskkill /F` (terminaison inconditionnelle) ne peut être
+# intercepté par AUCUN code utilisateur, par conception du système
+# d'exploitation : ce mécanisme ne peut donc pas EMPÊCHER une coupure
+# forcée, seulement la DISTINGUER d'un arrêt volontaire — en déposant un
+# marqueur juste avant de s'arrêter PROPREMENT (Ctrl+C, fermeture de
+# console, arrêt de service/déconnexion). Le watchdog, lui, constate
+# l'absence de ce marqueur après une disparition inattendue et le
+# signale au serveur — la différence entre "l'attaquant a coupé la
+# télémétrie sans laisser de trace" et "le dashboard l'affiche
+# immédiatement".
+# ──────────────────────────────────────────────────────────
+GRACEFUL_SHUTDOWN_MARKER = "graceful_shutdown.flag"
+
+
+def _write_graceful_marker():
+    try:
+        folder = agent_data_dir()
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, GRACEFUL_SHUTDOWN_MARKER), "w", encoding="utf-8") as f:
+            f.write(datetime.utcnow().isoformat(timespec="seconds"))
+    except OSError:
+        pass
+
+
+if _IS_WINDOWS:
+    # CTRL_CLOSE_EVENT=2 (fermeture de la fenêtre console), CTRL_LOGOFF_EVENT=5,
+    # CTRL_SHUTDOWN_EVENT=6 (arrêt de la machine) — Ctrl+C (CTRL_C_EVENT=0) est
+    # déjà couvert côté Python par KeyboardInterrupt, voir tout en bas du fichier.
+    _CONSOLE_CTRL_HANDLER_TYPE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def _console_ctrl_handler(ctrl_type):
+        if ctrl_type in (2, 5, 6):
+            _write_graceful_marker()
+        return False  # ne bloque jamais le traitement normal de l'évènement par Windows
+
+    _console_ctrl_handler_ref = _CONSOLE_CTRL_HANDLER_TYPE(_console_ctrl_handler)
+    _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True)
+
+
+def _self_file_path():
+    """Chemin du fichier actuellement exécuté : l'exécutable figé par
+    PyInstaller (voir build_agent.bat) s'il est "frozen", sinon ce
+    script source — c'est CE fichier dont l'intégrité est vérifiée par
+    check_self_integrity()."""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(__file__)
+
+
+def _integrity_baseline_path():
+    return os.path.join(agent_data_dir(), "integrity.json")
+
+
+def check_self_integrity(cfg):
+    """Compare le hash du fichier actuellement exécuté à une référence
+    enregistrée lors du tout premier lancement. Ne peut RIEN EMPÊCHER —
+    un attaquant avec les mêmes droits que l'agent peut modifier le
+    fichier ET cette référence dans la foulée — mais détecte un
+    changement qui N'est PAS passé par une mise à jour légitime
+    (_consume_applied_update(), appelée juste avant CETTE fonction dans
+    main(), rafraîchit explicitement la référence après une mise à jour
+    vérifiée par hash — voir check_for_update()). Mieux vaut une
+    détection contournable par un attaquant averti que ne rien détecter
+    du tout. Appelé une seule fois au démarrage (voir main()), pas à
+    chaque cycle — hasher tout le binaire toutes les 15s serait un
+    gaspillage pour quelque chose qui ne change quasiment jamais hors
+    mise à jour."""
+    path = _self_file_path()
+    current_hash = hash_file(path)
+    if not current_hash:
+        return
+
+    baseline_path = _integrity_baseline_path()
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            baseline = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        baseline = None
+
+    if baseline is None or baseline.get("path") != path:
+        # Premier lancement (ou changement de mode script/exe) : on
+        # enregistre la référence, rien à signaler encore.
+        _write_integrity_baseline(baseline_path, path, current_hash)
+        return
+
+    if baseline.get("hash") != current_hash:
+        ev = event_schema.make_event(
+            "agent_tampered", cfg["agent_id"], event_queue.next_seq(),
+            data={"path": path, "expected_hash": baseline.get("hash"), "actual_hash": current_hash},
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+        # Ne re-signale pas en boucle à chaque redémarrage tant que le
+        # fichier ne change plus — une alerte par changement constaté.
+        _write_integrity_baseline(baseline_path, path, current_hash)
+
+
+def _write_integrity_baseline(baseline_path, path, file_hash):
+    try:
+        with open(baseline_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"path": path, "hash": file_hash, "recorded_at": datetime.utcnow().isoformat(timespec="seconds")},
+                f,
+            )
+    except OSError:
+        pass
+
+
+# ──────────────────────────────────────────────────────────
+# Mise à jour automatique — voir edr_watchdog.py pour la moitié
+# "échange réel du fichier" du mécanisme (impossible depuis CE
+# processus : le fichier .exe en cours d'exécution est verrouillé par
+# Windows tant qu'il tourne). Cette moitié-ci ne fait que : vérifier
+# s'il existe une version plus récente, la télécharger dans un dossier
+# de préparation, vérifier son empreinte sha256 contre celle annoncée
+# par le serveur (rejette silencieusement en cas de désaccord — reste
+# sur la version actuelle plutôt que d'exécuter un binaire dont
+# l'origine n'est plus garantie), puis déposer un marqueur et
+# s'arrêter PROPREMENT (comme un Ctrl+C) pour laisser le watchdog
+# faire l'échange une fois le verrou de fichier libéré.
+# N'a de sens que pour un exécutable figé (voir build_agent.bat) —
+# un script source se met à jour en éditant le fichier, pas en se
+# remplaçant lui-même.
+# ──────────────────────────────────────────────────────────
+UPDATE_READY_MARKER = "update_ready.json"
+
+
+def _update_ready_marker_path():
+    return os.path.join(agent_data_dir(), UPDATE_READY_MARKER)
+
+
+class _RestartForUpdate(Exception):
+    """Signal interne : une mise à jour vérifiée est prête, il faut
+    s'arrêter proprement pour laisser edr_watchdog.py l'appliquer."""
+
+
+def check_for_update(cfg):
+    if not getattr(sys, "frozen", False):
+        return  # rien à remplacer pour un lancement en script source
+
+    try:
+        resp = requests.get(
+            f"{cfg['server_url']}/api/agents/update-check",
+            params={"version": AGENT_VERSION},
+            headers={"X-Agent-Key": cfg["api_key"]}, timeout=15,
+        )
+        if resp.status_code != 200:
+            return
+        info = resp.json()
+    except (requests.RequestException, ValueError):
+        return
+    if not info.get("update_available"):
+        return
+
+    staging_dir = os.path.join(agent_data_dir(), "update_staging")
+    staged_path = os.path.join(staging_dir, f"EDRAgent.exe.{info['version']}.new")
+    try:
+        os.makedirs(staging_dir, exist_ok=True)
+        dl = requests.get(
+            f"{cfg['server_url']}/api/agents/update-download",
+            headers={"X-Agent-Key": cfg["api_key"]}, timeout=180,
+        )
+        if dl.status_code != 200:
+            return
+        with open(staged_path, "wb") as f:
+            f.write(dl.content)
+    except (requests.RequestException, OSError):
+        return
+
+    # hash_file() met en cache par chemin — chemin unique par version ci-
+    # dessus, donc jamais de collision avec un téléchargement précédent.
+    actual_hash = hash_file(staged_path)
+    if actual_hash != info.get("sha256"):
+        print(f"[update] Empreinte inattendue pour la version {info['version']} — abandon, "
+              f"conservation de la version actuelle.")
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
+        return
+
+    try:
+        with open(_update_ready_marker_path(), "w", encoding="utf-8") as f:
+            json.dump({"version": info["version"], "staged_path": staged_path, "sha256": actual_hash}, f)
+    except OSError:
+        return
+
+    print(f"[update] Version {info['version']} vérifiée et prête — redémarrage pour l'appliquer.")
+    raise _RestartForUpdate()
+
+
+def _consume_applied_update():
+    """Appelé au tout début de main(), AVANT check_self_integrity() :
+    si une mise à jour vient d'être appliquée par le watchdog (le
+    fichier actuellement exécuté correspond au sha256 qu'on avait
+    nous-même vérifié avant de s'arrêter), rafraîchit silencieusement
+    la référence d'intégrité — sinon check_self_integrity() prendrait
+    ce changement légitime pour une falsification."""
+    marker_path = _update_ready_marker_path()
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    current_hash = hash_file(_self_file_path())
+    if current_hash and current_hash == marker.get("sha256"):
+        _write_integrity_baseline(_integrity_baseline_path(), _self_file_path(), current_hash)
+        print(f"[update] Version {marker.get('version')} appliquée avec succès.")
+    # Sinon : marqueur périmé ou incohérent (ex. l'agent a été relancé
+    # sans passer par le watchdog) — laissé tel quel, sans y toucher ;
+    # ce n'est PAS à l'agent de décider s'il s'agit d'une anomalie.
+
+    try:
+        os.remove(marker_path)
+    except OSError:
+        pass
 
 
 def get_integrity_level(pid):
@@ -2036,6 +2291,10 @@ def main():
     global _cycle_count
     cfg = get_config()
     event_queue.init_db()
+    harden_folder_permissions(agent_data_dir())
+    harden_folder_permissions(quarantine_dir())
+    _consume_applied_update()
+    check_self_integrity(cfg)
     start_file_watchers()
     emit_collectors_started(cfg)
     print("── Agent NHGuard démarré ──")
@@ -2073,6 +2332,8 @@ def main():
         _cycle_count += 1
         if _cycle_count % IOC_REFRESH_EVERY_N_CYCLES == 0:
             fetch_iocs(cfg)
+        if _cycle_count % UPDATE_CHECK_EVERY_N_CYCLES == 0:
+            check_for_update(cfg)
 
         print(f"[{time.strftime('%H:%M:%S')}] CPU {stats['cpu_percent']}% · "
               f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}% · "
@@ -2083,5 +2344,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except _RestartForUpdate:
+        _write_graceful_marker()
+        print("\nAgent arrêté pour mise à jour.")
     except KeyboardInterrupt:
+        _write_graceful_marker()
         print("\nAgent arrêté.")

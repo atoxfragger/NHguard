@@ -1,0 +1,244 @@
+"""
+edr_watchdog.py — Superviseur de edr_agent.py.
+
+Le relance s'il s'arrête de façon inattendue (crash, `taskkill /F`,
+panne), et signale au serveur une extinction sans marqueur d'arrêt
+propre. C'est la meilleure protection atteignable en espace utilisateur :
+`taskkill /F` termine un processus de façon INCONDITIONNELLE, par
+conception du système d'exploitation — AUCUN code utilisateur, ici ou
+ailleurs, ne peut s'y opposer. Ce superviseur ne peut donc pas EMPÊCHER
+une coupure forcée, seulement la CONSTATER et la signaler — ce qui reste
+la différence entre "l'attaquant a coupé la télémétrie sans laisser de
+trace" et "le dashboard l'affiche immédiatement, avec l'heure exacte".
+
+Résilience à DEUX niveaux, volontairement PAS un mutual-watchdog "maison"
+(agent et superviseur qui se surveillent l'un l'autre) — plus complexe à
+faire correctement (risque de boucle, de double redémarrage) pour un
+bénéfice marginal par rapport à réutiliser ce que Windows sait déjà bien
+faire :
+  1. CE script redémarre edr_agent.py s'il meurt (boucle ci-dessous).
+  2. Le Planificateur de tâches Windows redémarre CE script s'il meurt
+     lui-même — voir install_as_scheduled_task() : option native
+     "redémarrer en cas d'échec", pas de logique à réinventer.
+
+Le signalement d'une extinction inattendue est envoyé DIRECTEMENT au
+serveur (pas via la file locale de l'agent, potentiellement inaccessible
+ou altérée si c'est justement ce qui a été attaqué) — best effort : si le
+réseau est aussi coupé, il ne reste rien de plus à faire depuis cette
+machine seule.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+import requests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import event_schema
+
+APP_NAME = "EDRAgent"
+GRACEFUL_SHUTDOWN_MARKER = "graceful_shutdown.flag"
+
+MIN_RESTART_INTERVAL_SECONDS = 5
+MAX_BACKOFF_SECONDS = 300
+CRASH_LOOP_THRESHOLD = 5          # redémarrages en moins de CRASH_LOOP_WINDOW_SECONDS...
+CRASH_LOOP_WINDOW_SECONDS = 120   # ...déclenche une pause longue plutôt qu'une boucle serrée
+
+
+def _agent_data_dir():
+    """Même calcul que edr_agent.agent_data_dir() — dupliqué
+    volontairement : le superviseur doit rester utilisable même si
+    edr_agent.py est cassé (ex: mise à jour ratée, voir un futur
+    edr_updater.py), donc il ne l'importe jamais."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, APP_NAME)
+
+
+def _graceful_marker_path():
+    return os.path.join(_agent_data_dir(), GRACEFUL_SHUTDOWN_MARKER)
+
+
+def _load_config():
+    path = os.path.join(_agent_data_dir(), "config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _report_unexpected_exit(cfg, exit_code):
+    if not cfg or not cfg.get("server_url") or not cfg.get("api_key"):
+        return
+    try:
+        ev = event_schema.make_event(
+            "agent_unexpected_exit", cfg.get("agent_id", "inconnu"), 0,
+            data={"exit_code": exit_code, "reported_by": "watchdog"},
+            os_name=sys.platform,
+        )
+        requests.post(
+            f"{cfg['server_url']}/api/agents/events",
+            json=[ev], headers={"X-Agent-Key": cfg["api_key"]}, timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[!] Impossible de signaler l'extinction inattendue (réseau injoignable ?) : {e}")
+
+
+def _frozen_exe_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "EDRAgent.exe")
+
+
+def _agent_command():
+    """Localise ce qu'il faut relancer : l'exécutable buildé (voir
+    build_agent.bat) s'il existe à côté de ce script, sinon le script
+    source (environnement de développement)."""
+    frozen_exe = _frozen_exe_path()
+    if os.path.isfile(frozen_exe):
+        return [frozen_exe]
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [sys.executable, os.path.join(here, "edr_agent.py")]
+
+
+def _update_ready_marker_path():
+    """Même chemin/format que edr_agent.py:_update_ready_marker_path() —
+    dupliqué volontairement, voir _agent_data_dir() ci-dessus."""
+    return os.path.join(_agent_data_dir(), "update_ready.json")
+
+
+def _sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _apply_pending_update():
+    """S'exécute au début de chaque tour de boucle, AVANT de relancer
+    l'agent : si edr_agent.py a préparé une mise à jour (voir sa
+    fonction check_for_update — déjà vérifiée par sha256 une première
+    fois côté agent, avant même de s'arrêter), échange le binaire
+    MAINTENANT, pendant que le processus agent est arrêté et le
+    fichier .exe donc déverrouillé — un remplacement de fichier en
+    cours d'exécution échouerait sur Windows. Revérifie le sha256 une
+    SECONDE fois ici (défense en profondeur : le fichier de préparation
+    aurait pu être altéré entre les deux étapes) avant d'écraser le
+    binaire réellement utilisé. Le marqueur n'est PAS supprimé en cas
+    de succès : edr_agent.py le lit à son prochain démarrage pour
+    rafraîchir sa référence d'intégrité sans se signaler lui-même comme
+    falsifié (voir _consume_applied_update() côté agent)."""
+    marker_path = _update_ready_marker_path()
+    if not os.path.exists(marker_path):
+        return
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    staged_path = marker.get("staged_path", "")
+    expected_hash = marker.get("sha256", "")
+    if not os.path.isfile(staged_path):
+        print(f"[update] Fichier préparé introuvable ({staged_path}) — mise à jour abandonnée.")
+        try:
+            os.remove(marker_path)
+        except OSError:
+            pass
+        return
+
+    if _sha256_of(staged_path) != expected_hash:
+        print("[update] Empreinte du fichier préparé incohérente — mise à jour abandonnée, "
+              "conservation de la version actuelle.")
+        try:
+            os.remove(staged_path)
+            os.remove(marker_path)
+        except OSError:
+            pass
+        return
+
+    try:
+        os.replace(staged_path, _frozen_exe_path())
+        print(f"[update] Version {marker.get('version')} appliquée sur le binaire.")
+        # Le marqueur reste en place — voir docstring : edr_agent.py le
+        # consomme à son prochain démarrage.
+    except OSError as e:
+        print(f"[!] Échec de l'échange du binaire ({e}) — nouvel essai au prochain redémarrage.")
+
+
+def supervise():
+    print("── Superviseur NHGuard démarré ──")
+    recent_restarts = []
+    while True:
+        marker = _graceful_marker_path()
+        if os.path.exists(marker):
+            os.remove(marker)  # marqueur d'un cycle précédent, ne doit pas fausser celui-ci
+
+        _apply_pending_update()
+
+        cmd = _agent_command()
+        print(f"[{datetime.utcnow().isoformat(timespec='seconds')}] Lancement : {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(cmd)
+            exit_code = proc.wait()
+        except OSError as e:
+            print(f"[!] Impossible de lancer l'agent : {e}")
+            exit_code = None
+
+        graceful = os.path.exists(marker)
+        if graceful:
+            os.remove(marker)
+            print("Arrêt propre détecté — pas de signalement.")
+        else:
+            print(f"⚠️  Arrêt INATTENDU (code={exit_code}) — signalement au serveur.")
+            _report_unexpected_exit(_load_config(), exit_code)
+
+        now = time.time()
+        recent_restarts = [t for t in recent_restarts if now - t < CRASH_LOOP_WINDOW_SECONDS]
+        recent_restarts.append(now)
+        if len(recent_restarts) >= CRASH_LOOP_THRESHOLD:
+            wait = MAX_BACKOFF_SECONDS
+            print(f"Trop de redémarrages en {CRASH_LOOP_WINDOW_SECONDS}s "
+                  f"({len(recent_restarts)}) — pause longue ({wait}s) pour éviter une boucle de crash.")
+        else:
+            wait = MIN_RESTART_INTERVAL_SECONDS
+        time.sleep(wait)
+
+
+def install_as_scheduled_task():
+    """Enregistre CE superviseur comme tâche planifiée Windows, démarrée
+    à l'ouverture de session/au démarrage, relancée automatiquement en
+    cas d'échec — réutilise la résilience native de Windows plutôt que
+    d'écrire un second superviseur pour surveiller celui-ci. N'EST PAS
+    appelé automatiquement : à exécuter explicitement (ex: à l'install),
+    jamais en arrière-plan sans que l'opérateur sache qu'une tâche
+    planifiée persistante va être créée."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    watchdog_cmd = f'"{sys.executable}" "{os.path.join(here, "edr_watchdog.py")}"'
+    subprocess.run([
+        "schtasks", "/create", "/tn", "NHGuard-Watchdog", "/tr", watchdog_cmd,
+        "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f",
+    ], check=True)
+    # /f écrase une tâche existante du même nom (ré-installation idempotente) —
+    # la reprise sur échec ("redémarrer toutes les X minutes, Y fois") se
+    # configure via /RI en complément si besoin, non fait ici par défaut pour
+    # rester une action volontaire et visible plutôt qu'une valeur imposée.
+    print("Tâche planifiée 'NHGuard-Watchdog' installée (démarrage automatique).")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--install":
+        install_as_scheduled_task()
+    else:
+        try:
+            supervise()
+        except KeyboardInterrupt:
+            print("\nSuperviseur arrêté.")

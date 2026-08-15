@@ -1,0 +1,74 @@
+"""
+publish_update.py — Publie une nouvelle version de EDRAgent.exe.
+
+Script OPÉRATEUR (l'éditeur de NHGuard), à lancer à la main sur la
+machine qui héberge edr_server.py — PAS un endpoint HTTP du dashboard.
+
+C'est un choix de sécurité délibéré, pas juste un raccourci : ce
+serveur est multi-tenant (voir main serveur / db_users.py), et le
+binaire agent publié ici est distribué à TOUS les clients à la fois.
+Si publier une nouvelle version était accessible via le dashboard
+(même réservé aux comptes "admin"), n'importe quel client compromis
+ou malveillant pourrait pousser un exécutable arbitraire vers TOUS les
+autres clients — une compromission de la chaîne d'approvisionnement,
+justement ce qu'un EDR est censé détecter. En exigeant un accès
+FICHIER sur la machine serveur elle-même, la question "qui peut
+publier une mise à jour" se réduit à "qui a un accès shell sur ce
+serveur" — déjà le niveau de confiance le plus élevé du système.
+
+Usage :
+    python publish_update.py chemin/vers/EDRAgent.exe 1.1.0
+
+Effet : copie le fichier dans agent_updates/ (créé si besoin), calcule
+son sha256, et enregistre {version, filename, sha256} en base — c'est
+cet enregistrement que /api/agents/update-check consulte (voir main
+serveur) pour répondre aux agents qui vérifient s'ils sont à jour.
+"""
+
+import hashlib
+import os
+import shutil
+import sys
+
+import db_data
+
+UPDATES_DIR = "agent_updates"
+
+
+def _sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def publish(source_path, version):
+    if not os.path.isfile(source_path):
+        print(f"Fichier introuvable : {source_path}")
+        return False
+    if not version or version.strip() != version or " " in version:
+        print("Version invalide (ex. attendu : 1.1.0)")
+        return False
+
+    os.makedirs(UPDATES_DIR, exist_ok=True)
+    filename = f"EDRAgent-{version}.exe"
+    dest_path = os.path.join(UPDATES_DIR, filename)
+    shutil.copy2(source_path, dest_path)
+
+    sha256 = _sha256_of(dest_path)
+    db_data.init_db()
+    db_data.set_latest_release(version, filename, sha256)
+
+    print(f"Version {version} publiée : {dest_path}")
+    print(f"sha256 : {sha256}")
+    print("Les agents la détecteront à leur prochaine vérification (update-check).")
+    return True
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage : python publish_update.py <chemin_vers_EDRAgent.exe> <version>")
+        sys.exit(1)
+    ok = publish(sys.argv[1], sys.argv[2])
+    sys.exit(0 if ok else 1)

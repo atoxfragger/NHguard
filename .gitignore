@@ -1,0 +1,21 @@
+# Secrets réels (voir .env.example pour le modèle)
+.env
+
+# Bases SQLite locales — données de test/dev, jamais de vraies données
+# client dans le dépôt
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build agent (voir build_agent.bat)
+build/
+dist/
+*.spec
+
+# Binaires publiés (voir publish_update.py) — trop volumineux et
+# régénérables depuis le code, n'ont rien à faire dans l'historique git
+agent_updates/
+
+__pycache__/
+*.pyc

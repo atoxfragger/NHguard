@@ -43,6 +43,7 @@ import behaviour_engine
 import temporal_correlator
 import process_tree
 import event_schema
+import policy_engine
 
 app = Flask(__name__)
 CORS(app)
@@ -76,11 +77,36 @@ def static_html(filename):
     return send_from_directory(BASE_DIR, filename)
 
 
-# ⚠️ Même Client ID que celui utilisé côté frontend.
+# Pas un secret : ce Client ID est de toute façon visible côté navigateur
+# dans register/edr_console (OAuth exige qu'il soit public) — inutile de
+# l'externaliser avec les vrais secrets ci-dessous.
 GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleusercontent.com"
 
+
+def _load_dotenv(path=".env"):
+    """Charge un fichier .env minimal (CLE=valeur, une par ligne, '#' pour
+    commentaire) dans os.environ — SANS écraser une variable déjà définie
+    dans l'environnement réel (ex. injectée par le service/conteneur en
+    production), et sans dépendance supplémentaire (python-dotenv) pour
+    une poignée de lignes. Fichier optionnel : absent en production où
+    les vraies variables d'environnement suffisent, présent seulement
+    pour le confort en développement local — voir .env.example."""
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
 # ──────────────────────────────────────────────────────────
-# Configuration SMTP — à renseigner avant de lancer le serveur.
+# Configuration SMTP — via variables d'environnement (voir .env.example),
+# jamais en clair dans le code : ce fichier finit sur GitHub.
 # Exemple avec Gmail : activez la validation en 2 étapes sur le compte
 # Gmail expéditeur, puis créez un "mot de passe d'application" sur
 # https://myaccount.google.com/apppasswords (le mot de passe normal du
@@ -90,20 +116,24 @@ GOOGLE_CLIENT_ID = "652339744386-d8cjl24ahm1638i88sjd744kp66ni4db.apps.googleuse
 # suspecte...). Si l'envoi recommence à échouer avec une erreur 535,
 # retournez sur la page apppasswords et régénérez-en un nouveau.
 # ──────────────────────────────────────────────────────────
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = ""
-SMTP_PASSWORD = ""
-SMTP_FROM_NAME = "NHGuard"
+SMTP_HOST = os.environ.get("NHGUARD_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("NHGUARD_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("NHGUARD_SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("NHGUARD_SMTP_PASSWORD", "")
+SMTP_FROM_NAME = os.environ.get("NHGUARD_SMTP_FROM_NAME", "NHGuard")
+
+if not SMTP_USER or not SMTP_PASSWORD:
+    print("[!] NHGUARD_SMTP_USER / NHGUARD_SMTP_PASSWORD non définis — "
+          "l'envoi d'email (2FA, notifications du Policy Engine) échouera. "
+          "Voir .env.example.")
 
 
-def send_verification_email(to_email: str, code: str):
-    msg = MIMEText(
-        f"Votre code de vérification NHGuard est : {code}\n\n"
-        f"Il expire dans 5 minutes. Si vous n'êtes pas à l'origine de cette "
-        f"demande de connexion, ignorez cet e-mail."
-    )
-    msg["Subject"] = f"{code} — Code de vérification NHGuard"
+def send_email(to_email: str, subject: str, body: str):
+    """Envoi SMTP générique — extrait de l'ancien send_verification_email
+    pour être réutilisé par le Policy Engine (action "notify_only", voir
+    policy_engine.py) sans dupliquer la configuration/connexion SMTP."""
+    msg = MIMEText(body)
+    msg["Subject"] = subject
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
     msg["To"] = to_email
 
@@ -111,6 +141,16 @@ def send_verification_email(to_email: str, code: str):
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, [to_email], msg.as_string())
+
+
+def send_verification_email(to_email: str, code: str):
+    send_email(
+        to_email,
+        f"{code} — Code de vérification NHGuard",
+        f"Votre code de vérification NHGuard est : {code}\n\n"
+        f"Il expire dans 5 minutes. Si vous n'êtes pas à l'origine de cette "
+        f"demande de connexion, ignorez cet e-mail.",
+    )
 
 
 PENDING_2FA = {}   # temp_token -> {"email": ..., "org_id": ..., "code": ..., "expires": ...}
@@ -455,6 +495,40 @@ def _run_behavior_correlation(org_id, agent_id):
             score_breakdown=None, score_details=verdict["details"],
             confidence=verdict["confidence"], is_correlation=True,
         )
+        _apply_policies(org_id, agent_id, verdict["severity"], verdict["confidence"], "comportemental")
+
+
+def _apply_policies(org_id, agent_id, severity, confidence, category):
+    """Point d'entrée UNIQUE du Policy Engine (voir policy_engine.py) —
+    appelé après CHAQUE création d'alerte, qu'elle vienne d'un instantané
+    de détection (agent_alert) ou d'une synthèse comportementale
+    (_run_behavior_correlation), pour ne jamais avoir deux chemins de
+    décision divergents sur les mêmes règles."""
+    if not agent_id:
+        return
+    policies = db_data.get_policies(org_id)
+    if not policies:
+        return  # aucune politique configurée -> comportement 100% manuel, inchangé
+
+    matched = policy_engine.evaluate_policies(
+        policies, {"severity": severity, "confidence": confidence, "category": category}
+    )
+    for p in matched:
+        if p["action"] == "isolate":
+            if not db_data.is_agent_isolated(org_id, agent_id):
+                db_data.create_command(org_id, agent_id, "isolate")
+        elif p["action"] == "notify_only":
+            for user in db_users.get_users_by_org(org_id):
+                try:
+                    send_email(
+                        user["email"],
+                        f"[NHGuard] Alerte {severity} sur {agent_id}",
+                        f"La politique « {p['name']} » a matché une alerte {severity} "
+                        f"(catégorie : {category or 'n/a'}) sur l'agent {agent_id}.\n\n"
+                        f"Consultez le dashboard pour plus de détails.",
+                    )
+                except (smtplib.SMTPException, OSError) as e:
+                    print(f"[!] Policy Engine : échec de la notification à {user['email']} : {e}")
 
 
 @app.route("/api/agents/alert", methods=["POST"])
@@ -499,6 +573,7 @@ def agent_alert():
         threat_score=threat_score, impact_score=impact_score,
     )
 
+    _apply_policies(request.org_id, data["agent_id"], severity, confidence, data.get("category", "autre"))
     _run_behavior_correlation(request.org_id, data["agent_id"])
 
     return jsonify({"success": True, "id": alert_id, "score": score, "severity": severity}), 201
@@ -712,12 +787,89 @@ def remove_ioc(ioc_id):
     return jsonify({"success": True})
 
 
+# ══════════════════════════════════════════════════════════
+#  Policy Engine — réponse automatique configurable (voir policy_engine.py)
+# ══════════════════════════════════════════════════════════
+
+@app.route("/api/policies", methods=["GET"])
+@require_auth
+def list_policies():
+    return jsonify(db_data.get_policies(request.org_id, enabled_only=False))
+
+
+@app.route("/api/policies", methods=["POST"])
+@require_auth
+def add_policy():
+    data = request.get_json(force=True) or {}
+    name = data.get("name", "").strip()
+    action = data.get("action")
+    if not name or action not in ("isolate", "notify_only"):
+        return jsonify({"error": "name et action (isolate/notify_only) requis"}), 400
+    min_severity = data.get("min_severity")
+    if min_severity and min_severity not in ("low", "medium", "high", "critical"):
+        return jsonify({"error": "min_severity doit être low/medium/high/critical"}), 400
+    policy_id = db_data.create_policy(
+        request.org_id, name, action,
+        min_severity=min_severity,
+        min_confidence=data.get("min_confidence"),
+        category=data.get("category"),
+        enabled=data.get("enabled", True),
+    )
+    return jsonify({"success": True, "id": policy_id}), 201
+
+
+@app.route("/api/policies/<policy_id>", methods=["DELETE"])
+@require_auth
+def remove_policy(policy_id):
+    db_data.delete_policy(request.org_id, policy_id)
+    return jsonify({"success": True})
+
+
 @app.route("/api/agents/iocs", methods=["GET"])
 @require_agent_key
 def agent_get_iocs():
     """L'agent récupère périodiquement la liste des IoC de son organisation
     pour son moteur de détection local (hash, IP, motifs de ligne de commande)."""
     return jsonify(db_data.get_iocs(request.org_id))
+
+
+# ══════════════════════════════════════════════════════════
+#  Mise à jour de l'agent — un seul binaire pour tous les clients
+#  (voir publish_update.py : jamais publié depuis le dashboard)
+# ══════════════════════════════════════════════════════════
+UPDATES_DIR = os.path.join(BASE_DIR, "agent_updates")
+
+
+@app.route("/api/agents/update-check", methods=["GET"])
+@require_agent_key
+def agent_update_check():
+    """L'agent envoie sa version actuelle ; réponse minimale, jamais le
+    binaire lui-même ici (voir update-download) — évite de faire
+    transiter potentiellement des dizaines de Mo à chaque heartbeat
+    alors qu'aucune mise à jour n'est même disponible la plupart du temps."""
+    current_version = request.args.get("version", "")
+    release = db_data.get_latest_release()
+    if not release or release["version"] == current_version:
+        return jsonify({"update_available": False})
+    return jsonify({
+        "update_available": True,
+        "version": release["version"],
+        "sha256": release["sha256"],
+    })
+
+
+@app.route("/api/agents/update-download", methods=["GET"])
+@require_agent_key
+def agent_update_download():
+    """Sert le binaire actuellement publié — toujours le DERNIER, quelle
+    que soit la version demandée : l'agent revérifie le sha256 annoncé
+    par update-check avant de faire quoi que ce soit du fichier reçu, ce
+    endpoint n'a donc pas besoin de connaître/valider la version de
+    l'appelant."""
+    release = db_data.get_latest_release()
+    if not release:
+        return jsonify({"error": "Aucune version publiée"}), 404
+    return send_from_directory(UPDATES_DIR, release["filename"], as_attachment=True)
 
 
 # ══════════════════════════════════════════════════════════
