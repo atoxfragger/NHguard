@@ -48,16 +48,21 @@ le résultat "failed" est rapporté au serveur.
 
 import ctypes
 from ctypes import wintypes
+import csv
 import gzip
 import hashlib
+import io
 import json
 import os
 import platform
+import queue as _queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 
 import psutil
@@ -135,12 +140,25 @@ _agent_start_time = time.time()
 # ──────────────────────────────────────────────────────────
 # Configuration locale
 # ──────────────────────────────────────────────────────────
-def config_path():
+def agent_data_dir():
+    """Dossier de données propres à l'agent (config, file locale
+    event_queue.db, logs) — voir aussi event_queue._app_data_dir(), même
+    calcul, dupliqué volontairement pour ne pas coupler agent.py à
+    event_queue.py au-delà de son API publique. Utilisé notamment par
+    collect_file_events() pour EXCLURE ce dossier de la télémétrie
+    fichiers : %APPDATA% est un des dossiers surveillés, et sans cette
+    exclusion l'agent se mettrait à rapporter ses propres écritures dans
+    sa file locale comme si c'était un évènement observé sur la machine —
+    un bruit auto-référentiel constaté en testant."""
     if platform.system() == "Windows":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     else:
         base = os.path.join(os.path.expanduser("~"), ".config")
-    folder = os.path.join(base, APP_NAME)
+    return os.path.join(base, APP_NAME)
+
+
+def config_path():
+    folder = agent_data_dir()
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "config.json")
 
@@ -826,6 +844,25 @@ if _IS_WINDOWS:
     _kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     _kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
 
+    # ReadDirectoryChangesW — surveillance de dossiers en temps réel (voir
+    # collect_file_events plus bas), validée en conditions réelles sur
+    # cette machine (create/modify/rename/delete tous correctement
+    # capturés) avant intégration.
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_SHARE_RWD = 0x00000001 | 0x00000002 | 0x00000004
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _FILE_NOTIFY_CHANGE_MASK = 0x00000001 | 0x00000002 | 0x00000010  # nom fichier + nom dossier + dernière écriture
+
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _kernel32.ReadDirectoryChangesW.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.BOOL,
+                                                 wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                                 wintypes.LPVOID, wintypes.LPVOID]
+    _kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+
     _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
     _advapi32.OpenProcessToken.restype = wintypes.BOOL
     _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
@@ -1189,8 +1226,17 @@ _prev_pids = None
 _prev_connections = None
 _prev_registry_snapshot = None
 _prev_users = None
+_prev_dns_records = None
+_prev_services = None
+_prev_scheduled_tasks = None
 
-_collector_health = {"process": "healthy", "network": "healthy", "registry": "healthy", "user": "healthy"}
+_collector_health = {
+    "process": "healthy", "network": "healthy", "registry": "healthy", "user": "healthy",
+    "file": "healthy" if _IS_WINDOWS else "unavailable",
+    "dns": "healthy" if _IS_WINDOWS else "unavailable",
+    "service": "healthy" if _IS_WINDOWS else "unavailable",
+    "scheduled_task": "healthy" if _IS_WINDOWS else "unavailable",
+}
 
 _SECRET_CMDLINE_PATTERN = re.compile(
     r"(?i)(password|passwd|pwd|secret|token|apikey|api[_-]?key|access[_-]?key)(\s*[=:]\s*)(\S+)"
@@ -1259,6 +1305,12 @@ def collect_process_events(cfg):
                 "integrity_level": get_integrity_level(pid),
                 "session_id": get_session_id(pid),
                 "signed": is_authenticode_signed(path) if path else None,
+                # Réutilise SCRIPT_INTERPRETERS (déjà la référence pour la
+                # détection LOLBin, voir scan_processes) plutôt qu'un flux
+                # d'évènements SCRIPT_EXECUTION séparé : chaque exécution
+                # de script EST déjà un process_start, inutile de la
+                # télémétrer deux fois — ce champ suffit à la distinguer.
+                "is_script_interpreter": name.lower() in SCRIPT_INTERPRETERS,
             },
             os_name=platform.system(),
         )
@@ -1308,20 +1360,97 @@ def collect_network_events(cfg):
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
         event_type = "dns_query" if dst_port == 53 else "network_connect"
+        data = {
+            "process": proc_name,
+            "protocol": "UDP" if c.type == socket.SOCK_DGRAM else "TCP",
+            "source_ip": src_ip, "source_port": src_port,
+            "destination_ip": dst_ip, "destination_port": dst_port,
+        }
+        if event_type == "dns_query":
+            # Distingue cette source (connexion vers le port 53 — donne le
+            # pid mais pas le nom de domaine) de collect_dns_events
+            # (cache résolveur Windows — donne le nom de domaine mais pas
+            # le pid). Les deux sont complémentaires, voir sa docstring.
+            data["source"] = "connection_proxy"
         ev = event_schema.make_event(
             event_type, cfg["agent_id"], event_queue.next_seq(),
             actor={"pid": pid, "ppid": None, "user": None},
-            data={
-                "process": proc_name,
-                "protocol": "UDP" if c.type == socket.SOCK_DGRAM else "TCP",
-                "source_ip": src_ip, "source_port": src_port,
-                "destination_ip": dst_ip, "destination_port": dst_port,
-            },
-            os_name=platform.system(),
+            data=data, os_name=platform.system(),
         )
         event_queue.enqueue(ev)
 
     _prev_connections = current_keys
+
+
+def _parse_displaydns(output):
+    """Parse la sortie de `ipconfig /displaydns` (cache résolveur DNS de
+    Windows, partagé par toute la machine) en liste de
+    {"domain": str, "ip": str} — ne garde que les enregistrements A (type
+    1) et AAAA (type 28), les résolutions directes ; ignore PTR/CNAME
+    pour rester concentré sur "quel domaine a été résolu vers quelle IP"."""
+    records = []
+    current_name = None
+    current_type = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("-"):
+            continue
+        low = line.lower()
+        if low.startswith("record name"):
+            current_name = line.split(":", 1)[-1].strip().rstrip(".")
+            current_type = None
+        elif low.startswith("record type"):
+            try:
+                current_type = int(line.split(":", 1)[-1].strip())
+            except ValueError:
+                current_type = None
+        elif "record" in low and ":" in line and current_type in (1, 28):
+            value = line.split(":", 1)[-1].strip()
+            if current_name and value:
+                records.append({"domain": current_name, "ip": value})
+    return records
+
+
+def collect_dns_events(cfg):
+    """Interroge le cache résolveur DNS de Windows (ipconfig /displaydns,
+    déjà présent sur toute installation Windows — aucune dépendance
+    supplémentaire) et compare au cycle précédent — donne le vrai NOM DE
+    DOMAINE résolu, contrairement au simple proxy "connexion vers le port
+    53" de collect_network_events(). Limite assumée, documentée plutôt
+    que cachée : ce cache est PARTAGÉ par toute la machine, pas par
+    processus — impossible d'attribuer une résolution à un pid précis
+    avec cette technique (il faudrait un hook du résolveur ou une
+    capture de paquets, hors de portée d'un agent en espace utilisateur
+    pur). Les deux collecteurs DNS sont donc complémentaires : celui-ci
+    donne le domaine sans le pid, l'autre donne le pid sans le domaine."""
+    global _prev_dns_records
+    if not _IS_WINDOWS:
+        return
+    try:
+        output = subprocess.check_output(
+            ["ipconfig", "/displaydns"], text=True, errors="replace", timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        records = _parse_displaydns(output)
+    except Exception:
+        _collector_health["dns"] = "stalled"
+        return
+    _collector_health["dns"] = "healthy"
+
+    current = {(r["domain"], r["ip"]) for r in records}
+    if _prev_dns_records is None:
+        _prev_dns_records = current
+        return
+
+    for domain, ip in current - _prev_dns_records:
+        ev = event_schema.make_event(
+            "dns_query", cfg["agent_id"], event_queue.next_seq(),
+            data={"domain": domain, "resolved_ip": ip, "source": "resolver_cache"},
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    _prev_dns_records = current
 
 
 # Clés de démarrage automatique classiques — mêmes emplacements que ceux
@@ -1357,10 +1486,15 @@ def _read_registry_values(hive_name, subkey):
     return values
 
 
-def _emit_persistence_event(cfg, event_type, key_path, value_name, value_data):
+def _emit_persistence_event(cfg, event_type, method, key_path, value_name, value_data):
+    """Point d'émission COMMUN aux mécanismes de persistance détectés par
+    plusieurs collecteurs différents (registre, dossier de démarrage,
+    service Windows, tâche planifiée) — `method` les distingue
+    (registry_run_key / startup_folder / windows_service / scheduled_task)
+    sans dupliquer la construction de l'évènement dans chacun."""
     ev = event_schema.make_event(
         event_type, cfg["agent_id"], event_queue.next_seq(),
-        data={"method": "registry_run_key", "key": key_path, "name": value_name, "value": value_data},
+        data={"method": method, "key": key_path, "name": value_name, "value": value_data},
         os_name=platform.system(),
     )
     event_queue.enqueue(ev)
@@ -1395,14 +1529,97 @@ def collect_persistence_events(cfg):
         prev_values = _prev_registry_snapshot.get(label, {})
         for name, data in values.items():
             if name not in prev_values:
-                _emit_persistence_event(cfg, "persistence_created", label, name, data)
+                _emit_persistence_event(cfg, "persistence_created", "registry_run_key", label, name, data)
             elif prev_values[name] != data:
-                _emit_persistence_event(cfg, "persistence_modified", label, name, data)
+                _emit_persistence_event(cfg, "persistence_modified", "registry_run_key", label, name, data)
         for name in prev_values:
             if name not in values:
-                _emit_persistence_event(cfg, "persistence_removed", label, name, None)
+                _emit_persistence_event(cfg, "persistence_removed", "registry_run_key", label, name, None)
 
     _prev_registry_snapshot = snapshot
+
+
+def collect_service_events(cfg):
+    """Compare un instantané des services Windows (psutil.win_service_iter,
+    déjà une dépendance existante) au cycle précédent : un service
+    NOUVEAU, ou dont le binpath change sur un service EXISTANT
+    (détournement de service — remplacer l'exécutable d'un service légitime
+    par un autre, technique de persistance/élévation classique), est
+    rapporté. Même principe que collect_persistence_events : de la
+    télémétrie, pas un jugement de malveillance."""
+    global _prev_services
+    if not _IS_WINDOWS:
+        return
+    try:
+        current = {}
+        for s in psutil.win_service_iter():
+            try:
+                current[s.name()] = s.binpath()
+            except OSError:
+                # Certains services renvoient une erreur du chargeur de
+                # ressources Windows (fichier MUI introuvable) sur
+                # QueryServiceConfigW — un service isolé en échec ne doit
+                # pas faire perdre la visibilité sur tous les autres
+                # (constaté en testant : "WinError 15100" sur ce type de
+                # service, sans rapport avec sa légitimité).
+                continue
+    except Exception:
+        _collector_health["service"] = "stalled"
+        return
+    _collector_health["service"] = "healthy"
+
+    if _prev_services is None:
+        _prev_services = current
+        return
+
+    for name, binpath in current.items():
+        if name not in _prev_services:
+            _emit_persistence_event(cfg, "persistence_created", "windows_service", name, "binpath", binpath)
+        elif _prev_services[name] != binpath:
+            _emit_persistence_event(cfg, "persistence_modified", "windows_service", name, "binpath", binpath)
+    for name in _prev_services:
+        if name not in current:
+            _emit_persistence_event(cfg, "persistence_removed", "windows_service", name, "binpath", None)
+
+    _prev_services = current
+
+
+def collect_scheduled_task_events(cfg):
+    """Compare un instantané des tâches planifiées (`schtasks /query`,
+    déjà présent sur toute installation Windows) au cycle précédent — une
+    tâche planifiée nouvelle ou supprimée est un mécanisme de persistance
+    classique, au même titre qu'une clé de registre ou un service.
+    `/fo csv` sans `/v` reste volontairement léger (nom + prochaine
+    exécution + statut seulement) : suffisant pour détecter apparition/
+    disparition, un luxe de détail (commande exacte exécutée) demanderait
+    `/v` — nettement plus lourd sur une machine avec des centaines de
+    tâches, laissé à une itération future si le besoin se confirme."""
+    global _prev_scheduled_tasks
+    if not _IS_WINDOWS:
+        return
+    try:
+        output = subprocess.check_output(
+            ["schtasks", "/query", "/fo", "csv"], text=True, errors="replace", timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        reader = csv.reader(io.StringIO(output))
+        rows = list(reader)
+        current = {row[0] for row in rows[1:] if row}  # ignore l'en-tête, 1re colonne = nom de la tâche
+    except Exception:
+        _collector_health["scheduled_task"] = "stalled"
+        return
+    _collector_health["scheduled_task"] = "healthy"
+
+    if _prev_scheduled_tasks is None:
+        _prev_scheduled_tasks = current
+        return
+
+    for name in current - _prev_scheduled_tasks:
+        _emit_persistence_event(cfg, "persistence_created", "scheduled_task", name, "task_name", name)
+    for name in _prev_scheduled_tasks - current:
+        _emit_persistence_event(cfg, "persistence_removed", "scheduled_task", name, "task_name", None)
+
+    _prev_scheduled_tasks = current
 
 
 def collect_user_events(cfg):
@@ -1438,10 +1655,156 @@ def collect_user_events(cfg):
     _prev_users = users
 
 
+# ──────────────────────────────────────────────────────────
+# Collecteur FICHIERS — temps réel (ReadDirectoryChangesW via ctypes,
+# aucune dépendance supplémentaire), contrairement aux autres collecteurs
+# ci-dessus qui fonctionnent par différence d'instantanés. Validé en
+# conditions réelles sur cette machine (création/modification/
+# renommage/suppression, tous correctement capturés) avant intégration.
+#
+# Portée volontairement limitée à quelques dossiers sensibles plutôt que
+# tout le disque — surveiller un disque entier en continu serait coûteux
+# et noierait le signal utile dans du bruit (fichiers de cache, logs
+# applicatifs...). Ce sont les emplacements où un malware dépose
+# concrètement des fichiers : Téléchargements, Bureau, dossiers
+# temporaires, AppData, et le dossier de démarrage automatique.
+# ──────────────────────────────────────────────────────────
+def _resolve_file_watch_dirs():
+    if not _IS_WINDOWS:
+        return []
+    userprofile = os.environ.get("USERPROFILE", "")
+    appdata = os.environ.get("APPDATA", "")
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    programdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    candidates = [
+        os.path.join(userprofile, "Downloads") if userprofile else None,
+        os.path.join(userprofile, "Desktop") if userprofile else None,
+        os.environ.get("TEMP"),
+        appdata or None,
+        localappdata or None,
+        os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup") if appdata else None,
+        os.path.join(programdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+    ]
+    return sorted({p for p in candidates if p and os.path.isdir(p)})
+
+
+_FILE_WATCH_DIRS = _resolve_file_watch_dirs() if _IS_WINDOWS else []
+_FILE_ACTION_TYPES = {1: "file_create", 2: "file_delete", 3: "file_modify", 4: "file_rename", 5: "file_rename"}
+_FILE_ACTION_PHASE = {4: "old_name", 5: "new_name"}
+_file_change_queue = _queue.Queue()  # alimentée par les threads de surveillance, vidée par collect_file_events
+_file_watchers_started = False
+
+
+def _watch_directory_thread(path):
+    """Tourne en tâche de fond, UN thread PAR dossier surveillé : bloque
+    sur l'appel SYNCHRONE ReadDirectoryChangesW (pas besoin
+    d'OVERLAPPED/asynchrone ici, un thread dédié par dossier suffit vu le
+    nombre restreint de dossiers surveillés) et empile chaque changement
+    dans _file_change_queue pour que le cycle principal (non bloquant)
+    les transforme en évènements."""
+    h_dir = _kernel32.CreateFileW(
+        path, _FILE_LIST_DIRECTORY, _FILE_SHARE_RWD, None,
+        _OPEN_EXISTING, _FILE_FLAG_BACKUP_SEMANTICS, None,
+    )
+    if h_dir is None or h_dir == _INVALID_HANDLE_VALUE:
+        _collector_health["file"] = "stalled"
+        return
+
+    buf = ctypes.create_string_buffer(8192)
+    bytes_returned = wintypes.DWORD()
+    try:
+        while True:
+            ok = _kernel32.ReadDirectoryChangesW(
+                h_dir, buf, len(buf), True, _FILE_NOTIFY_CHANGE_MASK,
+                ctypes.byref(bytes_returned), None, None,
+            )
+            if not ok:
+                _collector_health["file"] = "stalled"
+                return
+            if bytes_returned.value == 0:
+                continue
+            raw = buf.raw
+            offset = 0
+            while True:
+                next_offset, action, name_len = struct.unpack_from("<III", raw, offset)
+                name = raw[offset + 12: offset + 12 + name_len].decode("utf-16-le", errors="replace")
+                _file_change_queue.put((action, os.path.join(path, name)))
+                if next_offset == 0:
+                    break
+                offset += next_offset
+    except Exception:
+        _collector_health["file"] = "stalled"
+    finally:
+        _kernel32.CloseHandle(h_dir)
+
+
+def start_file_watchers():
+    """Démarre un thread de surveillance par dossier sensible — appelé
+    UNE SEULE fois au démarrage de l'agent (voir main()). Aucun dossier
+    résolu (profil utilisateur introuvable, machine atypique) dégrade
+    gracieusement à "pas de télémétrie fichiers", jamais à un crash."""
+    global _file_watchers_started
+    if _file_watchers_started or not _IS_WINDOWS:
+        return
+    _file_watchers_started = True
+    if not _FILE_WATCH_DIRS:
+        _collector_health["file"] = "stalled"
+        return
+    for path in _FILE_WATCH_DIRS:
+        threading.Thread(target=_watch_directory_thread, args=(path,), daemon=True).start()
+
+
+def collect_file_events(cfg):
+    """Vide _file_change_queue et transforme chaque changement en
+    évènement normalisé, coalescé : un même (action, chemin) répété dans
+    le MÊME cycle ne produit qu'un seul évènement — Windows notifie
+    souvent plusieurs fois la même écriture (une écriture de contenu ET
+    une mise à jour d'horodatage, par exemple), constaté en testant."""
+    if not _IS_WINDOWS:
+        return
+    # normcase (minuscules + séparateurs uniformisés sur Windows) des DEUX
+    # côtés : les chemins reconstruits par _watch_directory_thread héritent
+    # du style de séparateur de la variable d'environnement d'origine, pas
+    # forcément celui que os.path.join produirait ailleurs — une simple
+    # comparaison de préfixe sans normalisation peut rater la correspondance.
+    own_data_dir = os.path.normcase(os.path.normpath(agent_data_dir()))
+    seen = set()
+    while True:
+        try:
+            action, path = _file_change_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if os.path.normcase(os.path.normpath(path)).startswith(own_data_dir):
+            continue  # bruit auto-référentiel (config, file locale, logs) — voir agent_data_dir()
+        event_type = _FILE_ACTION_TYPES.get(action, "file_modify")
+        key = (event_type, path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        data = {"path": path, "extension": os.path.splitext(path)[1].lower()}
+        if action in _FILE_ACTION_PHASE:
+            data["phase"] = _FILE_ACTION_PHASE[action]
+        ev = event_schema.make_event(
+            event_type, cfg["agent_id"], event_queue.next_seq(),
+            data=data, os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+        # Un fichier créé/modifié dans le dossier de démarrage automatique
+        # est un mécanisme de persistance à part entière, au même titre
+        # qu'une clé de registre — même sémantique que
+        # collect_persistence_events / _emit_persistence_event.
+        if event_type in ("file_create", "file_modify") and is_persistence_path(path):
+            _emit_persistence_event(cfg, "persistence_created", "startup_folder",
+                                     os.path.dirname(path), os.path.basename(path), path)
+
+
 def main():
     global _cycle_count
     cfg = get_config()
     event_queue.init_db()
+    start_file_watchers()
     print("── Agent NHGuard démarré ──")
     print(f"Identifiant : {cfg['agent_id']}")
     print(f"Serveur     : {cfg['server_url']}")
@@ -1454,11 +1817,17 @@ def main():
     while True:
         # Collecteurs de télémétrie continue AVANT le heartbeat, pour que
         # queue_size/collector_health reflètent ce cycle-ci et non le
-        # précédent (voir collect_system_stats).
+        # précédent (voir collect_system_stats). collect_file_events ne
+        # fait que VIDER une file déjà remplie en tâche de fond par les
+        # threads de start_file_watchers() — pas de coût de scan ici.
         collect_process_events(cfg)
         collect_network_events(cfg)
+        collect_dns_events(cfg)
         collect_persistence_events(cfg)
+        collect_service_events(cfg)
+        collect_scheduled_task_events(cfg)
         collect_user_events(cfg)
+        collect_file_events(cfg)
         flush_event_queue(cfg)
 
         stats = collect_system_stats(cfg["agent_id"])

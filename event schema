@@ -58,6 +58,7 @@ EVENT_PRIORITY = {
     "file_create":           "P2",
     "file_modify":           "P2",
     "file_delete":           "P2",
+    "file_rename":           "P2",
     "user_login":            "P2",
     # P3 — faible : informationnel
     "user_logout":           "P3",

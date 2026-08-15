@@ -124,6 +124,19 @@ RAW_TEMPORAL_PATTERNS = [
         "steps": ["dns_query", "network_connect"],
         "window_seconds": 2 * 60,
     },
+    {
+        # ⚠️ file_create (voir edr_agent.py:collect_file_events) ne porte
+        # PAS de pid — ReadDirectoryChangesW ne dit pas QUEL processus a
+        # écrit le fichier, seulement qu'il a été écrit. Ce motif ne peut
+        # donc jamais matcher au niveau "process_tree" (qui exige un pid),
+        # seulement en repli "machine entière" (confiance plafonnée par
+        # HOST_SCOPE_CONFIDENCE_PENALTY) — c'est honnête plutôt qu'un bug :
+        # la preuve est réellement plus faible, faute d'attribution par pid.
+        "id": "RTC-004",
+        "name": "Fichier déposé puis exécuté (dépôt puis lancement)",
+        "steps": ["file_create", "process_start"],
+        "window_seconds": 5 * 60,
+    },
 ]
 
 # Fenêtre maximale parmi TOUS les motifs (legacy + flux continu) : sert de
