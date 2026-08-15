@@ -49,6 +49,7 @@ le résultat "failed" est rapporté au serveur.
 import ctypes
 from ctypes import wintypes
 import csv
+from datetime import datetime
 import gzip
 import hashlib
 import io
@@ -364,20 +365,99 @@ def send_heartbeat(cfg, stats):
         print(f"[!] Serveur injoignable : {e}")
 
 
+# État de connectivité serveur constaté au dernier envoi — None tant que
+# rien n'a encore été tenté, pour ne pas émettre "reconnecté" au tout
+# premier envoi réussi du démarrage (il n'y avait pas eu de coupure).
+_server_connected = None
+_queue_full_notified = False
+
+
+def _emit_meta_event(cfg, event_type, data):
+    """Point d'émission commun aux évènements de santé de la télémétrie
+    elle-même (collecteurs, file, connectivité serveur — tous priorité
+    P0, voir event_schema.py) : permet à NHGuard de détecter "ma
+    télémétrie devient aveugle" plutôt que de le déduire indirectement
+    d'une absence de données (document source, sections 11 et 19)."""
+    ev = event_schema.make_event(
+        event_type, cfg["agent_id"], event_queue.next_seq(),
+        data=data, os_name=platform.system(),
+    )
+    event_queue.enqueue(ev)
+
+
+def emit_collectors_started(cfg):
+    """Un collector_started par collecteur, une seule fois au démarrage
+    de l'agent (voir main())."""
+    for name in _collector_health:
+        _emit_meta_event(cfg, "collector_started", {"collector": name})
+
+
+def emit_health_transition_events(cfg):
+    """Émet un évènement seulement quand la santé d'un collecteur CHANGE
+    (jamais à chaque cycle où rien n'a bougé, sinon ces P0 finiraient par
+    dominer le flux) — appelé une fois par cycle, après tous les
+    collecteurs (voir main())."""
+    global _prev_collector_health_snapshot
+    for name, status in _collector_health.items():
+        prev = _prev_collector_health_snapshot.get(name)
+        if prev is not None and prev != status and status != "unavailable":
+            event_type = "collector_error" if status == "stalled" else "collector_recovered"
+            _emit_meta_event(cfg, event_type, {"collector": name, "status": status, "previous_status": prev})
+    _prev_collector_health_snapshot = dict(_collector_health)
+
+
+def check_queue_pressure(cfg):
+    """Signale UNE FOIS quand la file locale atteint HARD_LIMIT (pas à
+    chaque cycle tant que ça reste plein) — voir event_queue.py pour le
+    backpressure lui-même, qui continue de fonctionner indépendamment de
+    cette notification."""
+    global _queue_full_notified
+    size = event_queue.queue_size()
+    if size >= event_queue.HARD_LIMIT and not _queue_full_notified:
+        _emit_meta_event(cfg, "queue_full", {"queue_size": size, "hard_limit": event_queue.HARD_LIMIT})
+        _queue_full_notified = True
+    elif size < event_queue.SOFT_LIMIT:
+        _queue_full_notified = False
+
+
+_prev_collector_health_snapshot = {}
+
+
 def flush_event_queue(cfg, max_batch=200):
     """Vide la file locale par LOTS compressés (jamais une requête HTTP
     par évènement, document source section 17) — Event -> Local Queue ->
     Batch -> Compression -> TLS -> Server. Ne retire de la file QUE ce
     que le serveur a confirmé avoir reçu (statut 201) : si l'envoi échoue
     en cours de route (coupure réseau pendant le POST), tout reste en
-    attente pour le prochain cycle, rien n'est perdu."""
-    batch = event_queue.dequeue_batch(max_batch)
+    attente pour le prochain cycle, rien n'est perdu.
+
+    Backpressure par PALIERS (document source, section 10), sans jamais
+    délester silencieusement un P0/P1 (ça reste le rôle d'event_queue.py) :
+      < 70% de HARD_LIMIT : lot normal, compression standard
+      70-90% : même taille de lot, compression gzip maximale (charge CPU
+               plus élevée, mais un lot plus petit à transmettre — utile
+               si le réseau lui-même est le goulot d'étranglement)
+      ≥ 90% : lots plus PETITS et donc plus fréquents — les priorités
+               les plus hautes (voir event_queue.dequeue_batch, toujours
+               P0 d'abord) sortent de la file plus vite qu'avec un seul
+               gros lot lent à construire et à envoyer."""
+    global _server_connected
+    queue_size = event_queue.queue_size()
+    occupancy = queue_size / event_queue.HARD_LIMIT if event_queue.HARD_LIMIT else 0
+    if occupancy >= 0.9:
+        batch_n, gzip_level = min(max_batch, 50), 9
+    elif occupancy >= 0.7:
+        batch_n, gzip_level = max_batch, 9
+    else:
+        batch_n, gzip_level = max_batch, 6
+
+    batch = event_queue.dequeue_batch(batch_n)
     if not batch:
         return
     seqs = [seq for seq, _ in batch]
     events = [ev for _, ev in batch]
     try:
-        payload = gzip.compress(json.dumps(events).encode("utf-8"))
+        payload = gzip.compress(json.dumps(events).encode("utf-8"), compresslevel=gzip_level)
     except (TypeError, ValueError) as e:
         print(f"[!] Lot d'évènements invalide, abandonné : {e}")
         return
@@ -390,10 +470,16 @@ def flush_event_queue(cfg, max_batch=200):
         r = requests.post(f"{cfg['server_url']}/api/agents/events", data=payload, headers=headers, timeout=10)
         if r.status_code == 201:
             event_queue.mark_sent(seqs)
+            if _server_connected is False:
+                _emit_meta_event(cfg, "server_connected", {})
+            _server_connected = True
         else:
             print(f"[!] Erreur envoi évènements ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
         print(f"[!] Serveur injoignable pour l'envoi d'évènements : {e}")
+        if _server_connected is not False:
+            _emit_meta_event(cfg, "server_disconnected", {"error": str(e)})
+        _server_connected = False
 
 
 def send_alert(cfg, title, description, severity, category, signals=None):
@@ -1227,6 +1313,11 @@ _prev_connections = None
 _prev_registry_snapshot = None
 _prev_users = None
 _prev_dns_records = None
+# IP -> domaine, reconstruit à CHAQUE appel de collect_dns_events à partir
+# de TOUT le cache résolveur courant (pas seulement les nouveautés) — sert
+# à relier "DNS -> IP -> connexion réseau" dans collect_network_events,
+# même si la résolution DNS a eu lieu plusieurs cycles plus tôt.
+_ip_to_domain = {}
 _prev_services = None
 _prev_scheduled_tasks = None
 
@@ -1252,6 +1343,44 @@ def redact_cmdline(cmdline):
     if not cmdline:
         return cmdline
     return _SECRET_CMDLINE_PATTERN.sub(r"\1\2***REDACTED***", cmdline)
+
+
+def _process_lineage(proc, max_levels=8):
+    """Remonte la lignée d'un processus via psutil.parent() (jusqu'à
+    max_levels crans, ou jusqu'à ne plus avoir de parent). Retourne
+    (parent_name, grandparent_name, root_pid) :
+      - parent_name/grandparent_name permettent de reconstruire une
+        chaîne comme "WINWORD -> PowerShell -> cmd -> payload" à partir
+        d'UN SEUL évènement process_start, sans dépendre du fait que le
+        parent ait lui-même un évènement dans la fenêtre observée (il a
+        pu démarrer avant l'agent, ou avant le début de la fenêtre).
+      - root_pid (le plus ancien ancêtre encore accessible) sert
+        d'identifiant de topologie STABLE pour regrouper tous les
+        évènements d'un même arbre de processus (voir process_tree_id
+        dans collect_process_events) — une étiquette structurelle, pas
+        un jugement de sécurité : l'agent ne décide toujours rien, il
+        se contente de nommer la forme de l'arbre qu'il observe."""
+    parent_name = grandparent_name = None
+    root_pid = proc.pid
+    current = proc
+    for level in range(max_levels):
+        try:
+            parent = current.parent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            break
+        if parent is None:
+            break
+        try:
+            pname = parent.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            break
+        if level == 0:
+            parent_name = pname
+        elif level == 1:
+            grandparent_name = pname
+        root_pid = parent.pid
+        current = parent
+    return parent_name, grandparent_name, root_pid
 
 
 def collect_process_events(cfg):
@@ -1296,12 +1425,19 @@ def collect_process_events(cfg):
             cmdline = redact_cmdline(" ".join(proc.cmdline()))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             cmdline = None
+        try:
+            creation_time = datetime.utcfromtimestamp(proc.create_time()).isoformat(timespec="seconds")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, OverflowError, ValueError):
+            creation_time = None
+
+        parent_name, grandparent_name, root_pid = _process_lineage(proc)
 
         ev = event_schema.make_event(
             "process_start", cfg["agent_id"], event_queue.next_seq(),
             actor={"pid": pid, "ppid": ppid, "user": user},
             data={
                 "process": name, "path": path, "command_line": cmdline,
+                "creation_time": creation_time,
                 # hash_file() est mis en cache par chemin (voir sa
                 # définition) : un même binaire relancé plusieurs fois ne
                 # coûte le calcul du hash qu'une seule fois.
@@ -1315,6 +1451,14 @@ def collect_process_events(cfg):
                 # de script EST déjà un process_start, inutile de la
                 # télémétrer deux fois — ce champ suffit à la distinguer.
                 "is_script_interpreter": name.lower() in SCRIPT_INTERPRETERS,
+                # Lignée (voir _process_lineage) : reconstruit une chaîne
+                # complète depuis un seul évènement, et process_tree_id
+                # regroupe tous les évènements d'un même arbre sans que le
+                # serveur ait à déduire lui-même la topologie — l'agent ne
+                # fait toujours que décrire ce qu'il voit, pas un jugement.
+                "parent_name": parent_name,
+                "grandparent_name": grandparent_name,
+                "process_tree_id": f"{cfg['agent_id']}:{root_pid}",
             },
             os_name=platform.system(),
         )
@@ -1369,6 +1513,12 @@ def collect_network_events(cfg):
             "protocol": "UDP" if c.type == socket.SOCK_DGRAM else "TCP",
             "source_ip": src_ip, "source_port": src_port,
             "destination_ip": dst_ip, "destination_port": dst_port,
+            # Relie DNS -> IP -> connexion (document source, section 4) en
+            # consultant la table construite par collect_dns_events —
+            # None si cette IP n'a pas été vue dans le cache résolveur
+            # (résolution antérieure au démarrage de l'agent, résolution
+            # côté serveur DNS interne non mise en cache localement, etc.)
+            "resolved_domain": _ip_to_domain.get(dst_ip) if event_type == "network_connect" else None,
         }
         if event_type == "dns_query":
             # Distingue cette source (connexion vers le port 53 — donne le
@@ -1463,6 +1613,13 @@ def collect_dns_events(cfg):
         _collector_health["dns"] = "stalled"
         return
     _collector_health["dns"] = "healthy"
+
+    # Reconstruit la table de correspondance inverse à CHAQUE appel, même
+    # cycles sans nouveauté — collect_network_events s'appuie dessus pour
+    # relier une connexion à un domaine résolu, potentiellement plusieurs
+    # cycles plus tôt.
+    _ip_to_domain.clear()
+    _ip_to_domain.update({r["ip"]: r["domain"] for r in records})
 
     current = {(r["domain"], r["ip"]) for r in records}
     if _prev_dns_records is None:
@@ -1781,6 +1938,49 @@ def start_file_watchers():
         threading.Thread(target=_watch_directory_thread, args=(path,), daemon=True).start()
 
 
+# Extensions dignes d'un hash (exécutables/scripts — ce qui a une valeur
+# de détection). Un document, une image, un log... n'est JAMAIS hashé :
+# hasher systématiquement tout fichier touché alourdirait l'agent pour
+# un bénéfice quasi nul (document source, section 3 : "ne hash pas
+# inutilement tous les fichiers").
+_HASHABLE_EXTENSIONS = {
+    ".exe", ".dll", ".sys", ".scr", ".com", ".bat", ".cmd",
+    ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+    ".msi", ".msp", ".jar", ".hta",
+}
+# Au-delà de cette taille, seules les métadonnées sont remontées — même un
+# fichier à l'extension "sensible" trop volumineux n'est pas hashé, pour
+# ne jamais bloquer un cycle de collecte sur un gros fichier. Plafond
+# volontairement bas (pas 50 Mo) : constaté en testant sur une machine
+# avec une vraie activité disque de fond (cache d'un client de jeu en
+# train de télécharger sous %LOCALAPPDATA%, l'un des dossiers surveillés)
+# qu'un plafond généreux peut faire traîner un cycle de collecte de
+# façon notable — un dropper malveillant fait presque toujours quelques
+# centaines de Ko à quelques Mo, pas des dizaines de Mo.
+_HASH_SIZE_CAP_BYTES = 8 * 1024 * 1024
+
+
+def _file_metadata(path, event_type):
+    """(size, hash) d'un fichier touché — stratégie de hash ADAPTATIVE :
+    seulement les extensions pertinentes pour la détection (voir
+    _HASHABLE_EXTENSIONS), et seulement sous _HASH_SIZE_CAP_BYTES. Un
+    fichier supprimé (event_type="file_delete") n'existe plus : ni taille
+    ni hash ne peuvent être lus — pas une erreur, juste un fait."""
+    if event_type == "file_delete":
+        return None, None
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        # Déjà disparu au moment où on l'inspecte (fichier temporaire très
+        # éphémère, ex: un fichier de verrouillage créé puis aussitôt
+        # supprimé) — pas un signal en soi, juste une fenêtre ratée.
+        return None, None
+    file_hash = None
+    if os.path.splitext(path)[1].lower() in _HASHABLE_EXTENSIONS and size <= _HASH_SIZE_CAP_BYTES:
+        file_hash = hash_file(path)
+    return size, file_hash
+
+
 def collect_file_events(cfg):
     """Vide _file_change_queue et transforme chaque changement en
     évènement normalisé, coalescé : un même (action, chemin) répété dans
@@ -1809,7 +2009,12 @@ def collect_file_events(cfg):
             continue
         seen.add(key)
 
-        data = {"path": path, "extension": os.path.splitext(path)[1].lower()}
+        size, file_hash = _file_metadata(path, event_type)
+        data = {
+            "path": path, "filename": os.path.basename(path),
+            "extension": os.path.splitext(path)[1].lower(),
+            "size": size, "hash": file_hash,
+        }
         if action in _FILE_ACTION_PHASE:
             data["phase"] = _FILE_ACTION_PHASE[action]
         ev = event_schema.make_event(
@@ -1832,6 +2037,7 @@ def main():
     cfg = get_config()
     event_queue.init_db()
     start_file_watchers()
+    emit_collectors_started(cfg)
     print("── Agent NHGuard démarré ──")
     print(f"Identifiant : {cfg['agent_id']}")
     print(f"Serveur     : {cfg['server_url']}")
@@ -1855,6 +2061,8 @@ def main():
         collect_scheduled_task_events(cfg)
         collect_user_events(cfg)
         collect_file_events(cfg)
+        emit_health_transition_events(cfg)
+        check_queue_pressure(cfg)
         flush_event_queue(cfg)
 
         stats = collect_system_stats(cfg["agent_id"])

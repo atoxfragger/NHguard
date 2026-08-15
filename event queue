@@ -54,18 +54,40 @@ def _db_path():
     return os.path.join(_app_data_dir(), "queue.db")
 
 
+# Connexion PERSISTANTE, ouverte une seule fois — chaque appel enqueue()/
+# next_seq() ouvrait auparavant sa PROPRE connexion SQLite, avec son
+# propre COMMIT synchrone. Mesuré en conditions réelles (charge) : ce
+# COMMIT par appel coûtait environ 90ms sur cette machine (probablement
+# le comportement de flush disque par défaut de SQLite sous Windows,
+# aggravé par l'antivirus temps réel qui inspecte chaque écriture) — soit
+# ~11 évènements/seconde en débit d'écriture, très en dessous de ce que
+# plusieurs collecteurs combinés peuvent produire. Une connexion unique
+# réutilisée, en mode WAL (moins de verrouillage, moins de flush complet
+# par transaction), corrige ça sans toucher au code appelant : _connection()
+# garde exactement la même interface `with _connection() as conn:` que
+# tout le reste du module utilise déjà.
+_conn = None
+
+
+def _get_connection():
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(_db_path(), timeout=10, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+    return _conn
+
+
 @contextmanager
 def _connection():
-    conn = sqlite3.connect(_db_path(), timeout=10)
-    conn.row_factory = sqlite3.Row
+    conn = _get_connection()
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    finally:
-        conn.close()
 
 
 def init_db():

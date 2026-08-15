@@ -404,6 +404,9 @@ def agent_events():
         db_data.create_raw_events(request.org_id, valid_events)
         agent_ids = {ev["host"]["id"] for ev in valid_events if ev.get("host", {}).get("id")}
         for agent_id in agent_ids:
+            seqs = [ev["seq"] for ev in valid_events
+                    if ev.get("host", {}).get("id") == agent_id and ev.get("seq") is not None]
+            db_data.update_sequence_tracking(request.org_id, agent_id, seqs)
             _run_behavior_correlation(request.org_id, agent_id)
 
     return jsonify({"success": True, "accepted": len(valid_events), "rejected": rejected}), 201

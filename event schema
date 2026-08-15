@@ -65,6 +65,15 @@ EVENT_PRIORITY = {
     "user_logout":           "P3",
     "session_start":         "P3",
     "session_end":           "P3",
+    # P0 — santé de la télémétrie elle-même : ne doit JAMAIS être délestée
+    # par le backpressure (voir event_queue.py), sans quoi l'agent
+    # perdrait la capacité de signaler qu'il perd sa propre télémétrie.
+    "collector_started":     "P0",
+    "collector_error":       "P0",
+    "collector_recovered":   "P0",
+    "server_connected":      "P0",
+    "server_disconnected":   "P0",
+    "queue_full":            "P0",
 }
 DEFAULT_PRIORITY = "P2"
 
