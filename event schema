@@ -44,13 +44,11 @@ SCHEMA_VERSION = 1
 # suppression est comptée, jamais silencieuse.
 # ──────────────────────────────────────────────────────────
 EVENT_PRIORITY = {
-    # P0 — critique : le comportement de l'agent ou des protections lui-même
-    "process_tampering":     "P0",
-    "protection_modified":   "P0",
     # P1 — important : ce qui alimente le plus directement la détection
     "process_start":         "P1",
     "network_connect":       "P1",
     "network_disconnect":    "P2",
+    "dns_query":             "P1",
     "persistence_created":   "P1",
     "persistence_modified":  "P1",
     # P2 — normal
@@ -63,8 +61,6 @@ EVENT_PRIORITY = {
     "user_login":            "P2",
     # P3 — faible : informationnel
     "user_logout":           "P3",
-    "session_start":         "P3",
-    "session_end":           "P3",
     # P0 — santé de la télémétrie elle-même : ne doit JAMAIS être délestée
     # par le backpressure (voir event_queue.py), sans quoi l'agent
     # perdrait la capacité de signaler qu'il perd sa propre télémétrie.

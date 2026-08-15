@@ -358,10 +358,16 @@ def compute_risk(signals: dict):
 
     # ── Score final : le threat domine, la confiance le module (jamais en
     # dessous de CONFIDENCE_FLOOR_FACTOR du threat brut), l'impact ajoute
-    # au plus IMPACT_CONTRIBUTION de sa propre échelle. ──
+    # au plus IMPACT_CONTRIBUTION de sa propre échelle — MAIS seulement
+    # s'il existe déjà une menace réelle : sans cette garde, une machine
+    # cochée "actif serveur" + "utilisateur admin" sans AUCUN signal de
+    # menace produirait un score non nul à partir du seul contexte, ce
+    # que le commentaire ci-dessus (et le même principe dans
+    # behaviour_engine.py / temporal_correlator.py) interdit explicitement :
+    # "le contexte renforce, il ne crée jamais la détection à lui seul".
     blended = (
         threat_score * (CONFIDENCE_FLOOR_FACTOR + (1 - CONFIDENCE_FLOOR_FACTOR) * confidence)
-        + impact_score * IMPACT_CONTRIBUTION
+        + (impact_score * IMPACT_CONTRIBUTION if threat_score > 0 else 0)
     )
     score = max(0, min(100, round(blended)))
     severity = _severity_for_score(score)

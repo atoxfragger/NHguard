@@ -101,6 +101,20 @@ def _redirect_output_if_no_console():
 
 _redirect_output_if_no_console()
 
+
+def _log(msg):
+    """Point d'émission UNIQUE des logs opérateur de l'agent (console, ou
+    agent.log en mode fenêtré — voir _redirect_output_if_no_console) :
+    préfixe chaque ligne d'un horodatage ISO 8601, pour que agent.log
+    reste exploitable a posteriori (avant, seule la ligne de statut
+    périodique portait un horodatage manuel — toutes les autres lignes,
+    y compris les erreurs, n'en avaient aucun). N'écrit JAMAIS ailleurs
+    que la sortie déjà en place (console ou fichier redirigé ci-dessus) —
+    pas un nouveau système de logs, juste une structure minimale sur
+    celui qui existe déjà."""
+    print(f"{datetime.utcnow().isoformat(timespec='seconds')} {msg}")
+
+
 # Liste basique de noms de processus considérés comme sensibles, à titre
 # d'exemple pédagogique — complétée par le moteur d'IoC ci-dessous.
 SUSPICIOUS_PROCESS_NAMES = {
@@ -391,11 +405,11 @@ def send_heartbeat(cfg, stats):
     try:
         r = requests.post(f"{cfg['server_url']}/api/agents/report", json=stats, headers=headers, timeout=5)
         if r.status_code == 401:
-            print("[!] Clé API rejetée par le serveur — vérifiez la configuration.")
+            _log("[!] Clé API rejetée par le serveur — vérifiez la configuration.")
         elif r.status_code != 200:
-            print(f"[!] Erreur heartbeat ({r.status_code}) : {r.text}")
+            _log(f"[!] Erreur heartbeat ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable : {e}")
+        _log(f"[!] Serveur injoignable : {e}")
 
 
 # État de connectivité serveur constaté au dernier envoi — None tant que
@@ -492,7 +506,7 @@ def flush_event_queue(cfg, max_batch=200):
     try:
         payload = gzip.compress(json.dumps(events).encode("utf-8"), compresslevel=gzip_level)
     except (TypeError, ValueError) as e:
-        print(f"[!] Lot d'évènements invalide, abandonné : {e}")
+        _log(f"[!] Lot d'évènements invalide, abandonné : {e}")
         return
 
     headers = {
@@ -507,9 +521,9 @@ def flush_event_queue(cfg, max_batch=200):
                 _emit_meta_event(cfg, "server_connected", {})
             _server_connected = True
         else:
-            print(f"[!] Erreur envoi évènements ({r.status_code}) : {r.text}")
+            _log(f"[!] Erreur envoi évènements ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable pour l'envoi d'évènements : {e}")
+        _log(f"[!] Serveur injoignable pour l'envoi d'évènements : {e}")
         if _server_connected is not False:
             _emit_meta_event(cfg, "server_disconnected", {"error": str(e)})
         _server_connected = False
@@ -527,11 +541,11 @@ def send_alert(cfg, title, description, severity, category, signals=None):
         if r.status_code == 201:
             resp = r.json()
             computed = f" (Risk Engine: score={resp.get('score')}, sévérité={resp.get('severity')})" if resp.get('score') is not None else ""
-            print(f"[ALERTE ENVOYÉE] {title}{computed}")
+            _log(f"[ALERTE ENVOYÉE] {title}{computed}")
             return resp.get("id")
-        print(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
+        _log(f"[!] Erreur envoi alerte ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable : {e}")
+        _log(f"[!] Serveur injoignable : {e}")
     return None
 
 
@@ -545,11 +559,11 @@ def send_quarantine(cfg, file_path, reason, action, severity, quarantine_path=No
     try:
         r = requests.post(f"{cfg['server_url']}/api/agents/quarantine", json=payload, headers=headers, timeout=5)
         if r.status_code == 201:
-            print(f"[QUARANTAINE] {file_path} ({action}, déplacé={file_moved})")
+            _log(f"[QUARANTAINE] {file_path} ({action}, déplacé={file_moved})")
         else:
-            print(f"[!] Erreur envoi quarantaine ({r.status_code}) : {r.text}")
+            _log(f"[!] Erreur envoi quarantaine ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable : {e}")
+        _log(f"[!] Serveur injoignable : {e}")
 
 
 def send_process_events(cfg, alert_id, events):
@@ -560,9 +574,9 @@ def send_process_events(cfg, alert_id, events):
     try:
         r = requests.post(f"{cfg['server_url']}/api/agents/process-events", json=payload, headers=headers, timeout=5)
         if r.status_code != 201:
-            print(f"[!] Erreur envoi arbre de processus ({r.status_code}) : {r.text}")
+            _log(f"[!] Erreur envoi arbre de processus ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable : {e}")
+        _log(f"[!] Serveur injoignable : {e}")
 
 
 def fetch_iocs(cfg):
@@ -592,10 +606,10 @@ def fetch_iocs(cfg):
         # motif EICAR intégré reste TOUJOURS actif, même si cet appel échoue
         # ou si l'organisation n'a configuré aucun IoC de ce type.
         _iocs_cache["content_pattern"] = antivirus_engine.load_content_patterns(iocs)
-        print(f"[IoC] {len(hashes)} hash, {len(ips)} IP, {len(patterns)} motifs, "
+        _log(f"[IoC] {len(hashes)} hash, {len(ips)} IP, {len(patterns)} motifs, "
               f"{len(_iocs_cache['content_pattern'])} motifs de contenu chargés")
     except requests.RequestException as e:
-        print(f"[!] Impossible de récupérer les IoC : {e}")
+        _log(f"[!] Impossible de récupérer les IoC : {e}")
 
 
 # ──────────────────────────────────────────────────────────
@@ -652,7 +666,7 @@ def send_command_result(cfg, command_id, status, result=""):
         requests.post(f"{cfg['server_url']}/api/agents/commands/{command_id}/result",
                        json={"status": status, "result": result}, headers=headers, timeout=5)
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable pour rapporter le résultat : {e}")
+        _log(f"[!] Serveur injoignable pour rapporter le résultat : {e}")
 
 
 def poll_and_execute_commands(cfg):
@@ -664,13 +678,13 @@ def poll_and_execute_commands(cfg):
             return
         commands = r.json()
     except requests.RequestException as e:
-        print(f"[!] Serveur injoignable pour les commandes : {e}")
+        _log(f"[!] Serveur injoignable pour les commandes : {e}")
         return
 
     for cmd in commands:
         action = cmd["action"]
         params = cmd.get("params", {})
-        print(f"[COMMANDE] {action} {params}")
+        _log(f"[COMMANDE] {action} {params}")
 
         if action == "isolate":
             ok, msg = isolate_network(cfg)
@@ -685,7 +699,7 @@ def poll_and_execute_commands(cfg):
         else:
             ok, msg = False, f"Action inconnue : {action}"
 
-        print(f"[COMMANDE {'OK' if ok else 'ÉCHEC'}] {msg}")
+        _log(f"[COMMANDE {'OK' if ok else 'ÉCHEC'}] {msg}")
         send_command_result(cfg, cmd["id"], "done" if ok else "failed", msg)
 
 
@@ -889,17 +903,6 @@ def build_process_ancestry(proc, max_levels=4):
         pass
 
     return events
-
-
-def is_ms_system_path(file_path):
-    """Le fichier se trouve-t-il dans un dossier système Windows courant ?
-    Heuristique simple (pas une vraie vérification de signature Authenticode,
-    qui demanderait une bibliothèque supplémentaire) — sert de proxy
-    raisonnable pour le signal 'file_ms_signed_path' du Risk Engine."""
-    if not file_path:
-        return False
-    p = file_path.lower().replace("/", "\\")
-    return "\\windows\\system32\\" in p or "\\windows\\syswow64\\" in p
 
 
 def is_persistence_path(file_path):
@@ -1207,7 +1210,7 @@ def check_for_update(cfg):
     # dessus, donc jamais de collision avec un téléchargement précédent.
     actual_hash = hash_file(staged_path)
     if actual_hash != info.get("sha256"):
-        print(f"[update] Empreinte inattendue pour la version {info['version']} — abandon, "
+        _log(f"[update] Empreinte inattendue pour la version {info['version']} — abandon, "
               f"conservation de la version actuelle.")
         try:
             os.remove(staged_path)
@@ -1221,7 +1224,7 @@ def check_for_update(cfg):
     except OSError:
         return
 
-    print(f"[update] Version {info['version']} vérifiée et prête — redémarrage pour l'appliquer.")
+    _log(f"[update] Version {info['version']} vérifiée et prête — redémarrage pour l'appliquer.")
     raise _RestartForUpdate()
 
 
@@ -1242,7 +1245,7 @@ def _consume_applied_update():
     current_hash = hash_file(_self_file_path())
     if current_hash and current_hash == marker.get("sha256"):
         _write_integrity_baseline(_integrity_baseline_path(), _self_file_path(), current_hash)
-        print(f"[update] Version {marker.get('version')} appliquée avec succès.")
+        _log(f"[update] Version {marker.get('version')} appliquée avec succès.")
     # Sinon : marqueur périmé ou incohérent (ex. l'agent a été relancé
     # sans passer par le watchdog) — laissé tel quel, sans y toucher ;
     # ce n'est PAS à l'agent de décider s'il s'agit d'une anomalie.
@@ -1362,7 +1365,7 @@ def quarantine_file(file_path):
         shutil.move(file_path, dest_path)
         return dest_path, True
     except Exception as e:
-        print(f"[!] Échec du déplacement en quarantaine : {e}")
+        _log(f"[!] Échec du déplacement en quarantaine : {e}")
         return None, False
 
 
@@ -2174,12 +2177,12 @@ def _on_access_scan(path, action):
             return
         quarantine_path, moved = quarantine_file(path)
         _av_block_queue.put((path, verdict, quarantine_path, moved))
-        print(f"[AV] Bloqué à l'écriture : {path} ({verdict['kind']})")
+        _log(f"[AV] Bloqué à l'écriture : {path} ({verdict['kind']})")
     except Exception as e:
         # Ce thread ne doit JAMAIS mourir à cause d'un scan qui échoue —
         # la télémétrie fichier (voir _file_change_queue ci-dessous) doit
         # continuer même si le scan EPP rencontre un problème inattendu.
-        print(f"[!] Scan EPP en échec pour {path} : {e}")
+        _log(f"[!] Scan EPP en échec pour {path} : {e}")
 
 
 def _watch_directory_thread(path):
@@ -2400,12 +2403,12 @@ def main():
     check_self_integrity(cfg)
     start_file_watchers()
     emit_collectors_started(cfg)
-    print("── Agent NHGuard démarré ──")
-    print(f"Identifiant : {cfg['agent_id']}")
-    print(f"Serveur     : {cfg['server_url']}")
-    print(f"Quarantaine : {quarantine_dir()}")
-    print(f"Config      : {config_path()}")
-    print("Ctrl+C pour arrêter.\n")
+    _log("── Agent NHGuard démarré ──")
+    _log(f"Identifiant : {cfg['agent_id']}")
+    _log(f"Serveur     : {cfg['server_url']}")
+    _log(f"Quarantaine : {quarantine_dir()}")
+    _log(f"Config      : {config_path()}")
+    _log("Ctrl+C pour arrêter.\n")
 
     fetch_iocs(cfg)
 
@@ -2439,7 +2442,7 @@ def main():
         if _cycle_count % UPDATE_CHECK_EVERY_N_CYCLES == 0:
             check_for_update(cfg)
 
-        print(f"[{time.strftime('%H:%M:%S')}] CPU {stats['cpu_percent']}% · "
+        _log(f"CPU {stats['cpu_percent']}% · "
               f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}% · "
               f"File {stats['queue_size']}")
         time.sleep(REPORT_INTERVAL_SECONDS)
@@ -2450,7 +2453,7 @@ if __name__ == "__main__":
         main()
     except _RestartForUpdate:
         _write_graceful_marker()
-        print("\nAgent arrêté pour mise à jour.")
+        _log("\nAgent arrêté pour mise à jour.")
     except KeyboardInterrupt:
         _write_graceful_marker()
-        print("\nAgent arrêté.")
+        _log("\nAgent arrêté.")

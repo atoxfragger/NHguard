@@ -50,6 +50,13 @@ CRASH_LOOP_THRESHOLD = 5          # redémarrages en moins de CRASH_LOOP_WINDOW_
 CRASH_LOOP_WINDOW_SECONDS = 120   # ...déclenche une pause longue plutôt qu'une boucle serrée
 
 
+def _log(msg):
+    """Même principe que edr_agent.py:_log() — horodatage ISO 8601
+    automatique sur chaque ligne, SANS créer de dépendance entre les deux
+    fichiers (dupliqué volontairement, voir _agent_data_dir() plus bas)."""
+    print(f"{datetime.utcnow().isoformat(timespec='seconds')} {msg}")
+
+
 def _agent_data_dir():
     """Même calcul que edr_agent.agent_data_dir() — dupliqué
     volontairement : le superviseur doit rester utilisable même si
@@ -89,7 +96,7 @@ def _report_unexpected_exit(cfg, exit_code):
             json=[ev], headers={"X-Agent-Key": cfg["api_key"]}, timeout=10,
         )
     except requests.RequestException as e:
-        print(f"[!] Impossible de signaler l'extinction inattendue (réseau injoignable ?) : {e}")
+        _log(f"[!] Impossible de signaler l'extinction inattendue (réseau injoignable ?) : {e}")
 
 
 def _frozen_exe_path():
@@ -148,7 +155,7 @@ def _apply_pending_update():
     staged_path = marker.get("staged_path", "")
     expected_hash = marker.get("sha256", "")
     if not os.path.isfile(staged_path):
-        print(f"[update] Fichier préparé introuvable ({staged_path}) — mise à jour abandonnée.")
+        _log(f"[update] Fichier préparé introuvable ({staged_path}) — mise à jour abandonnée.")
         try:
             os.remove(marker_path)
         except OSError:
@@ -156,7 +163,7 @@ def _apply_pending_update():
         return
 
     if _sha256_of(staged_path) != expected_hash:
-        print("[update] Empreinte du fichier préparé incohérente — mise à jour abandonnée, "
+        _log("[update] Empreinte du fichier préparé incohérente — mise à jour abandonnée, "
               "conservation de la version actuelle.")
         try:
             os.remove(staged_path)
@@ -167,15 +174,15 @@ def _apply_pending_update():
 
     try:
         os.replace(staged_path, _frozen_exe_path())
-        print(f"[update] Version {marker.get('version')} appliquée sur le binaire.")
+        _log(f"[update] Version {marker.get('version')} appliquée sur le binaire.")
         # Le marqueur reste en place — voir docstring : edr_agent.py le
         # consomme à son prochain démarrage.
     except OSError as e:
-        print(f"[!] Échec de l'échange du binaire ({e}) — nouvel essai au prochain redémarrage.")
+        _log(f"[!] Échec de l'échange du binaire ({e}) — nouvel essai au prochain redémarrage.")
 
 
 def supervise():
-    print("── Superviseur NHGuard démarré ──")
+    _log("── Superviseur NHGuard démarré ──")
     recent_restarts = []
     while True:
         marker = _graceful_marker_path()
@@ -185,20 +192,20 @@ def supervise():
         _apply_pending_update()
 
         cmd = _agent_command()
-        print(f"[{datetime.utcnow().isoformat(timespec='seconds')}] Lancement : {' '.join(cmd)}")
+        _log(f"Lancement : {' '.join(cmd)}")
         try:
             proc = subprocess.Popen(cmd)
             exit_code = proc.wait()
         except OSError as e:
-            print(f"[!] Impossible de lancer l'agent : {e}")
+            _log(f"[!] Impossible de lancer l'agent : {e}")
             exit_code = None
 
         graceful = os.path.exists(marker)
         if graceful:
             os.remove(marker)
-            print("Arrêt propre détecté — pas de signalement.")
+            _log("Arrêt propre détecté — pas de signalement.")
         else:
-            print(f"⚠️  Arrêt INATTENDU (code={exit_code}) — signalement au serveur.")
+            _log(f"⚠️  Arrêt INATTENDU (code={exit_code}) — signalement au serveur.")
             _report_unexpected_exit(_load_config(), exit_code)
 
         now = time.time()
@@ -206,7 +213,7 @@ def supervise():
         recent_restarts.append(now)
         if len(recent_restarts) >= CRASH_LOOP_THRESHOLD:
             wait = MAX_BACKOFF_SECONDS
-            print(f"Trop de redémarrages en {CRASH_LOOP_WINDOW_SECONDS}s "
+            _log(f"Trop de redémarrages en {CRASH_LOOP_WINDOW_SECONDS}s "
                   f"({len(recent_restarts)}) — pause longue ({wait}s) pour éviter une boucle de crash.")
         else:
             wait = MIN_RESTART_INTERVAL_SECONDS
@@ -231,7 +238,7 @@ def install_as_scheduled_task():
     # la reprise sur échec ("redémarrer toutes les X minutes, Y fois") se
     # configure via /RI en complément si besoin, non fait ici par défaut pour
     # rester une action volontaire et visible plutôt qu'une valeur imposée.
-    print("Tâche planifiée 'NHGuard-Watchdog' installée (démarrage automatique).")
+    _log("Tâche planifiée 'NHGuard-Watchdog' installée (démarrage automatique).")
 
 
 if __name__ == "__main__":
@@ -241,4 +248,4 @@ if __name__ == "__main__":
         try:
             supervise()
         except KeyboardInterrupt:
-            print("\nSuperviseur arrêté.")
+            _log("\nSuperviseur arrêté.")

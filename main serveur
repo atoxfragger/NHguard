@@ -22,6 +22,7 @@ Lancement :
 
 import gzip
 import json
+import logging
 import os
 import random
 import secrets
@@ -45,6 +46,14 @@ import process_tree
 import event_schema
 import policy_engine
 
+# Logs structurés (horodatage + niveau + message) plutôt que des print() —
+# ce fichier tourne comme un service long-lived (contrairement à
+# publish_update.py, un script opérateur ponctuel dont la sortie est lue
+# directement au terminal) : un format uniforme, filtrable par niveau,
+# est ce qu'un outil de supervision/agrégation de logs consommerait.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("nhguard")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -60,6 +69,32 @@ db_data.init_db()
 # servables, jamais les .py/.db/.bat (pas de traversée de dossier).
 # ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.errorhandler(400)
+@app.errorhandler(404)
+@app.errorhandler(405)
+@app.errorhandler(500)
+def _json_error(e):
+    """Réponses d'erreur UNIFORMES en JSON pour l'API — sans ceci, une
+    requête malformée (ex: corps JSON invalide envoyé par un agent buggé)
+    recevrait la page d'erreur HTML générique de Flask, incohérente avec
+    le reste de l'API qui répond toujours {"error": "..."} et donc
+    inexploitable par du code appelant. Les pages HTML servies par
+    static_html()/index() ci-dessous gardent la page d'erreur HTML
+    générique de Flask (acceptable pour un navigateur qui charge une
+    mauvaise URL) — seul /api/* est concerné."""
+    if request.path.startswith("/api/"):
+        code = getattr(e, "code", 500) or 500
+        message = getattr(e, "description", None) or str(e) or "Erreur serveur"
+        if code >= 500:
+            # Une 4xx est une erreur du CLIENT (requête malformée, route
+            # inexistante) — attendue, pas la peine de polluer les logs.
+            # Une 5xx est une erreur du SERVEUR — celle-là, un opérateur
+            # doit pouvoir la voir sans avoir à reproduire la requête.
+            logger.error(f"{request.method} {request.path} -> {code} : {message}", exc_info=e)
+        return jsonify({"error": message}), code
+    return e
 
 
 @app.route("/")
@@ -123,9 +158,16 @@ SMTP_PASSWORD = os.environ.get("NHGUARD_SMTP_PASSWORD", "")
 SMTP_FROM_NAME = os.environ.get("NHGUARD_SMTP_FROM_NAME", "NHGuard")
 
 if not SMTP_USER or not SMTP_PASSWORD:
-    print("[!] NHGUARD_SMTP_USER / NHGUARD_SMTP_PASSWORD non définis — "
-          "l'envoi d'email (2FA, notifications du Policy Engine) échouera. "
-          "Voir .env.example.")
+    logger.warning("NHGUARD_SMTP_USER / NHGUARD_SMTP_PASSWORD non définis — "
+                    "l'envoi d'email (2FA, notifications du Policy Engine) échouera. "
+                    "Voir .env.example.")
+
+
+SMTP_TIMEOUT_SECONDS = 10  # évite qu'un serveur SMTP injoignable bloque
+# une requête de connexion (2FA) pendant la durée du timeout TCP par
+# défaut de l'OS (potentiellement bien plus long que 10s) — sans ça,
+# une panne SMTP dégraderait aussi la disponibilité du login, pas
+# seulement l'envoi d'email lui-même.
 
 
 def send_email(to_email: str, subject: str, body: str):
@@ -137,7 +179,7 @@ def send_email(to_email: str, subject: str, body: str):
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
     msg["To"] = to_email
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, [to_email], msg.as_string())
@@ -183,7 +225,7 @@ def _start_2fa(email, org_id):
     try:
         send_verification_email(email, code)
     except Exception as e:
-        print(f"[!] Échec d'envoi de l'email à {email} : {e}")
+        logger.warning(f"Échec d'envoi de l'email à {email} : {e}")
     return temp_token
 
 
@@ -528,7 +570,7 @@ def _apply_policies(org_id, agent_id, severity, confidence, category):
                         f"Consultez le dashboard pour plus de détails.",
                     )
                 except (smtplib.SMTPException, OSError) as e:
-                    print(f"[!] Policy Engine : échec de la notification à {user['email']} : {e}")
+                    logger.warning(f"Policy Engine : échec de la notification à {user['email']} : {e}")
 
 
 @app.route("/api/agents/alert", methods=["POST"])

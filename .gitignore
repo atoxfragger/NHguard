@@ -19,3 +19,8 @@ agent_updates/
 
 __pycache__/
 *.pyc
+
+# Copies .py régénérées à chaque lancement des tests (voir tests/conftest.py)
+# — jamais commitées, toujours reconstruites depuis les fichiers trackés
+.pytest_modules/
+.pytest_cache/

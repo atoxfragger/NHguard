@@ -35,6 +35,32 @@ def get_connection():
         conn.close()
 
 
+def _ensure_column(conn, table, column, coltype, after_add=None):
+    """Migration douce : ajoute `column` à `table` s'il n'existe pas déjà
+    — cas d'une base SQLite créée par une version antérieure du produit,
+    avant l'ajout de cette colonne. `CREATE TABLE IF NOT EXISTS` ne fait
+    RIEN sur une table déjà existante, donc une colonne ajoutée après
+    coup au schéma ne se matérialise jamais toute seule sur une base
+    déjà en place — d'où ce garde-fou explicite, appelé pour CHAQUE
+    colonne ajoutée après la création initiale d'une table.
+
+    `after_add`, si fourni, est un callable(conn) exécuté UNE SEULE FOIS
+    juste après l'ajout réel de la colonne (ex : rétro-calculer une
+    valeur pour les lignes déjà existantes) — jamais rejoué sur une base
+    où la colonne existe déjà, pour ne pas écraser des valeurs réelles
+    avec un rétro-calcul destiné seulement à la migration initiale.
+
+    Retourne True si la colonne a été ajoutée (première fois), False si
+    elle existait déjà."""
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    if after_add:
+        after_add(conn)
+    return True
+
+
 def init_db():
     with get_connection() as conn:
         conn.execute("""
@@ -203,9 +229,7 @@ def init_db():
         # AVANT l'index sur hash : sur une base existant déjà avant l'ajout
         # de cette colonne, CREATE TABLE IF NOT EXISTS ne l'aurait pas créée
         # (table déjà existante = no-op) — l'index planterait sinon.
-        events_cols = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
-        if "hash" not in events_cols:
-            conn.execute("ALTER TABLE events ADD COLUMN hash TEXT")
+        _ensure_column(conn, "events", "hash", "TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_hash ON events(org_id, hash)")
         # Déduplication renforcée (document source, section 9) : en plus
         # de PRIMARY KEY(event_id, org_id), une seconde protection sur
@@ -228,8 +252,8 @@ def init_db():
             pass
 
         # Migration douce : si edr_data.db existait déjà avant l'ajout de ces
-        # colonnes, on les ajoute sans effacer les données existantes.
-        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(agents)")}
+        # colonnes, on les ajoute sans effacer les données existantes — voir
+        # _ensure_column().
         for col, coltype in [
             ("cpu_model", "TEXT"), ("ram_total_gb", "REAL DEFAULT 0"),
             ("local_ip", "TEXT"), ("logged_in_user", "TEXT"), ("processes", "TEXT"),
@@ -239,44 +263,35 @@ def init_db():
             ("collector_health", "TEXT"),
             ("last_seq", "INTEGER DEFAULT 0"), ("seq_gaps", "INTEGER DEFAULT 0"),
         ]:
-            if col not in existing_cols:
-                conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {coltype}")
+            _ensure_column(conn, "agents", col, coltype)
 
         for table in ("alerts", "quarantine"):
-            cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            if "is_demo" not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, table, "is_demo", "INTEGER NOT NULL DEFAULT 0")
 
-        quarantine_cols = {row["name"] for row in conn.execute("PRAGMA table_info(quarantine)")}
-        if "quarantine_path" not in quarantine_cols:
-            conn.execute("ALTER TABLE quarantine ADD COLUMN quarantine_path TEXT")
-        if "file_moved" not in quarantine_cols:
-            conn.execute("ALTER TABLE quarantine ADD COLUMN file_moved INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "quarantine", "quarantine_path", "TEXT")
+        _ensure_column(conn, "quarantine", "file_moved", "INTEGER NOT NULL DEFAULT 0")
 
-        alert_cols = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
-        if "score" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN score INTEGER NOT NULL DEFAULT 0")
-            # Rétro-calcule un score pour les alertes déjà existantes
+        def _retro_score(conn):
+            # Rétro-calcule un score pour les alertes déjà existantes,
+            # créées avant que cette colonne n'existe.
             for sev, sc in [("critical", 90), ("high", 70), ("medium", 45), ("low", 15)]:
                 conn.execute("UPDATE alerts SET score = ? WHERE severity = ? AND score = 0", (sc, sev))
-        if "score_breakdown" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN score_breakdown TEXT")
-        if "score_details" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN score_details TEXT")
-        if "confidence" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN confidence REAL")
-        if "threat_score" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN threat_score INTEGER")
-        if "impact_score" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN impact_score INTEGER")
-        if "is_correlation" not in alert_cols:
-            conn.execute("ALTER TABLE alerts ADD COLUMN is_correlation INTEGER NOT NULL DEFAULT 0")
-            # Rétro-marque les alertes déjà créées par les moteurs de corrélation,
-            # pour que les stats existantes ne les comptent pas rétroactivement
-            # comme des détections brutes (voir get_stats).
+
+        def _retro_is_correlation(conn):
+            # Rétro-marque les alertes déjà créées par les moteurs de
+            # corrélation, pour que les stats existantes ne les comptent
+            # pas rétroactivement comme des détections brutes (voir get_stats).
             conn.execute(
                 "UPDATE alerts SET is_correlation = 1 WHERE category IN ('comportemental', 'chaine_temporelle')"
             )
+
+        _ensure_column(conn, "alerts", "score", "INTEGER NOT NULL DEFAULT 0", after_add=_retro_score)
+        _ensure_column(conn, "alerts", "score_breakdown", "TEXT")
+        _ensure_column(conn, "alerts", "score_details", "TEXT")
+        _ensure_column(conn, "alerts", "confidence", "REAL")
+        _ensure_column(conn, "alerts", "threat_score", "INTEGER")
+        _ensure_column(conn, "alerts", "impact_score", "INTEGER")
+        _ensure_column(conn, "alerts", "is_correlation", "INTEGER NOT NULL DEFAULT 0", after_add=_retro_is_correlation)
 
 
 # Score de repli si le Risk Engine n'a pas pu être appliqué (ex: alerte créée
@@ -793,30 +808,6 @@ def update_sequence_tracking(org_id, agent_id, seqs):
             "UPDATE agents SET last_seq = ?, seq_gaps = ? WHERE org_id = ? AND agent_id = ?",
             (max(last_seq, batch_max), gaps, org_id, agent_id),
         )
-
-
-def get_average_latency_ms(org_id, agent_id, limit=50):
-    """Latence moyenne (ms) entre l'horodatage d'un évènement (côté agent)
-    et sa réception côté serveur, sur les derniers évènements reçus —
-    précision limitée à la seconde (même convention que le reste de
-    NHGuard, voir timestamp/received_at), donc un indicateur de TENDANCE
-    plus qu'une mesure fine : utile pour repérer une dégradation nette
-    (document source, section 8 : 5s, 10s, 30s de retard), pas pour du
-    profilage sub-seconde. None si aucun évènement récent."""
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT timestamp, received_at FROM events WHERE org_id = ? AND agent_id = ? "
-            "ORDER BY received_at DESC LIMIT ?",
-            (org_id, agent_id, limit),
-        ).fetchall()
-    deltas = []
-    for r in rows:
-        try:
-            delta = (datetime.fromisoformat(r["received_at"]) - datetime.fromisoformat(r["timestamp"])).total_seconds()
-        except (TypeError, ValueError):
-            continue
-        deltas.append(max(0, delta) * 1000)
-    return round(sum(deltas) / len(deltas)) if deltas else None
 
 
 def compute_telemetry_health(agent):
