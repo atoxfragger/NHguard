@@ -59,7 +59,27 @@ def init_db():
                 processes      TEXT,   -- JSON: liste des processus en cours (snapshot)
                 is_demo        INTEGER NOT NULL DEFAULT 0,
                 isolated       INTEGER NOT NULL DEFAULT 0,
+                queue_size     INTEGER DEFAULT 0,   -- taille de la file locale de l'agent (event_queue.py)
+                agent_uptime   INTEGER DEFAULT 0,   -- secondes depuis le démarrage de l'agent
+                collector_health TEXT,              -- JSON: {"process": "healthy"|"stalled", ...}
                 PRIMARY KEY (agent_id, org_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                event_id       TEXT NOT NULL,
+                org_id         INTEGER NOT NULL,
+                agent_id       TEXT NOT NULL,
+                seq            INTEGER,
+                event_type     TEXT NOT NULL,
+                priority       TEXT,
+                pid            INTEGER,
+                ppid           INTEGER,
+                actor_user     TEXT,
+                data           TEXT NOT NULL,   -- JSON: le champ "data" de l'évènement (voir event_schema.py)
+                timestamp      TEXT NOT NULL,
+                received_at    TEXT NOT NULL,
+                PRIMARY KEY (event_id, org_id)
             )
         """)
         conn.execute("""
@@ -145,6 +165,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_org_ts ON alerts(org_id, timestamp DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_org_sev ON alerts(org_id, severity)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_agent_ts ON events(org_id, agent_id, timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org_type ON events(org_id, event_type)")
 
         # Migration douce : si edr_data.db existait déjà avant l'ajout de ces
         # colonnes, on les ajoute sans effacer les données existantes.
@@ -154,6 +176,8 @@ def init_db():
             ("local_ip", "TEXT"), ("logged_in_user", "TEXT"), ("processes", "TEXT"),
             ("is_demo", "INTEGER NOT NULL DEFAULT 0"), ("isolated", "INTEGER NOT NULL DEFAULT 0"),
             ("public_ip", "TEXT"), ("geo_city", "TEXT"), ("geo_region", "TEXT"), ("geo_country", "TEXT"),
+            ("queue_size", "INTEGER DEFAULT 0"), ("agent_uptime", "INTEGER DEFAULT 0"),
+            ("collector_health", "TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {coltype}")
@@ -215,6 +239,10 @@ def get_agents(org_id):
                 a["processes"] = json.loads(a["processes"]) if a.get("processes") else []
             except (TypeError, json.JSONDecodeError):
                 a["processes"] = []
+            try:
+                a["collector_health"] = json.loads(a["collector_health"]) if a.get("collector_health") else {}
+            except (TypeError, json.JSONDecodeError):
+                a["collector_health"] = {}
             agents.append(a)
         return agents
 
@@ -222,17 +250,26 @@ def get_agents(org_id):
 def upsert_agent(org_id, agent_id, status, cpu_percent, ram_percent, disk_percent, os_name,
                   process_count, cpu_model=None, ram_total_gb=0, local_ip=None,
                   logged_in_user=None, processes=None, is_demo=False,
-                  public_ip=None, geo_city=None, geo_region=None, geo_country=None):
+                  public_ip=None, geo_city=None, geo_region=None, geo_country=None,
+                  queue_size=0, agent_uptime=0, collector_health=None):
     """Le champ isolated N'EST PAS écrasé ici : le statut d'isolement est géré
     séparément par set_agent_isolated(), pour ne pas être effacé à chaque
-    heartbeat normal de l'agent."""
+    heartbeat normal de l'agent.
+
+    queue_size/agent_uptime/collector_health : santé de la télémétrie
+    (voir event_queue.py côté agent) — un collecteur "stalled" ou une
+    file qui grossit sans se vider signale que l'agent ne remonte plus
+    (ou plus assez) d'évènements, indépendamment de son statut réseau
+    apparent (document source, section 19)."""
     processes_json = json.dumps(processes or [])
+    collector_health_json = json.dumps(collector_health) if collector_health else None
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO agents (agent_id, org_id, status, cpu_percent, ram_percent, disk_percent, os,
                                  last_seen, process_count, cpu_model, ram_total_gb, local_ip,
-                                 logged_in_user, processes, is_demo, public_ip, geo_city, geo_region, geo_country)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 logged_in_user, processes, is_demo, public_ip, geo_city, geo_region, geo_country,
+                                 queue_size, agent_uptime, collector_health)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id, org_id) DO UPDATE SET
                 status=excluded.status, cpu_percent=excluded.cpu_percent,
                 ram_percent=excluded.ram_percent, disk_percent=excluded.disk_percent,
@@ -241,11 +278,14 @@ def upsert_agent(org_id, agent_id, status, cpu_percent, ram_percent, disk_percen
                 local_ip=excluded.local_ip, logged_in_user=excluded.logged_in_user,
                 processes=excluded.processes, is_demo=excluded.is_demo,
                 public_ip=excluded.public_ip, geo_city=excluded.geo_city,
-                geo_region=excluded.geo_region, geo_country=excluded.geo_country
+                geo_region=excluded.geo_region, geo_country=excluded.geo_country,
+                queue_size=excluded.queue_size, agent_uptime=excluded.agent_uptime,
+                collector_health=excluded.collector_health
         """, (agent_id, org_id, status, cpu_percent, ram_percent, disk_percent, os_name,
               datetime.utcnow().isoformat(timespec="seconds"), process_count,
               cpu_model, ram_total_gb, local_ip, logged_in_user, processes_json,
-              1 if is_demo else 0, public_ip, geo_city, geo_region, geo_country))
+              1 if is_demo else 0, public_ip, geo_city, geo_region, geo_country,
+              queue_size, agent_uptime, collector_health_json))
 
 
 def set_agent_isolated(org_id, agent_id, isolated: bool):
@@ -560,6 +600,69 @@ def get_recent_process_events_for_agent(org_id, agent_id, since_minutes):
             (org_id, agent_id, since),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────
+# Évènements de télémétrie continue (voir event_schema.py / event_queue.py
+# côté agent) — flux brut indépendant des alertes, contrairement à
+# process_events ci-dessus qui ne naît qu'au moment d'une détection.
+# ──────────────────────────────────────────────────────────
+def create_raw_events(org_id, events):
+    """Insère un LOT d'évènements déjà validés (voir event_schema.validate_event,
+    appelé par l'appelant AVANT ceci — cette fonction ne revalide pas).
+    L'agent_id est lu depuis l'enveloppe de CHAQUE évènement (host.id) —
+    un lot ne vient jamais que d'une seule machine en pratique, mais rien
+    n'oblige cette fonction à le supposer. `INSERT OR IGNORE` : un
+    event_id déjà vu (ex: l'agent renvoie un lot après une confirmation
+    serveur perdue en route) est silencieusement ignoré plutôt que
+    dupliqué — c'est précisément le rôle de l'event_id unique (document
+    source, section 12 : déduplication)."""
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        for ev in events:
+            actor = ev.get("actor") or {}
+            conn.execute("""
+                INSERT OR IGNORE INTO events
+                    (event_id, org_id, agent_id, seq, event_type, priority, pid, ppid,
+                     actor_user, data, timestamp, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ev["event_id"], org_id, ev["host"]["id"], ev.get("seq"),
+                  ev["event"]["type"], ev["event"].get("priority"),
+                  actor.get("pid"), actor.get("ppid"), actor.get("user"),
+                  json.dumps(ev.get("data") or {}), ev["timestamp"], now))
+
+
+def get_recent_raw_events_for_agent(org_id, agent_id, since_minutes, event_types=None):
+    """Évènements de télémétrie continue d'UNE machine sur les
+    `since_minutes` dernières minutes — entrée du Temporal Correlator pour
+    la corrélation sur flux continu (voir temporal_correlator.correlate_raw_events).
+    event_types : liste optionnelle pour ne récupérer que certains types
+    (évite de charger tout le bruit informationnel non pertinent pour la
+    corrélation, ex: heartbeats)."""
+    since = (datetime.utcnow() - timedelta(minutes=since_minutes)).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        if event_types:
+            placeholders = ",".join("?" * len(event_types))
+            rows = conn.execute(
+                f"SELECT * FROM events WHERE org_id = ? AND agent_id = ? AND timestamp >= ? "
+                f"AND event_type IN ({placeholders}) ORDER BY timestamp, seq",
+                (org_id, agent_id, since, *event_types),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE org_id = ? AND agent_id = ? AND timestamp >= ? "
+                "ORDER BY timestamp, seq",
+                (org_id, agent_id, since),
+            ).fetchall()
+        out = []
+        for r in rows:
+            e = dict(r)
+            try:
+                e["data"] = json.loads(e["data"]) if e.get("data") else {}
+            except (TypeError, json.JSONDecodeError):
+                e["data"] = {}
+            out.append(e)
+        return out
 
 
 # ──────────────────────────────────────────────────────────

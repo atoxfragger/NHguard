@@ -238,18 +238,26 @@ def _severity_for_score(score):
     return "low"
 
 
-def evaluate(alerts, temporal_chains=None, now=None):
+def evaluate(alerts, agent_id="?", temporal_chains=None, now=None):
     """alerts : alertes d'UNE SEULE machine (déjà filtrées par agent_id
     côté appelant, voir db_data.get_recent_alerts_for_agent), dans
     n'importe quel ordre — ce module se charge de les trier et de ne
     garder que celles tombant dans la fenêtre de corrélation.
 
+    agent_id : identifiant de la machine évaluée, pour le titre/description
+    de l'alerte produite — fourni EXPLICITEMENT par l'appelant plutôt que
+    déduit de `alerts` : depuis que temporal_chains peut à lui seul
+    déclencher une alerte (voir plus bas), `alerts` peut être vide alors
+    qu'un verdict est bien produit, et il n'y aurait alors plus aucune
+    alerte dont déduire la machine concernée.
+
     temporal_chains : chaînes détectées par temporal_correlator.correlate()
-    pour la MÊME machine (optionnel) — voir l'en-tête du module : c'est la
-    preuve la plus forte du pipeline (continuité de pid/lignée de
-    processus sur au moins deux détections distinctes), intégrée ici au
-    même titre qu'une famille de signal Risk Engine plutôt que publiée
-    comme une alerte séparée par un moteur concurrent.
+    /.correlate_raw_events() pour la MÊME machine (optionnel) — voir
+    l'en-tête du module : c'est la preuve la plus forte du pipeline
+    (continuité de pid/lignée de processus sur au moins deux détections
+    distinctes), intégrée ici au même titre qu'une famille de signal Risk
+    Engine plutôt que publiée comme une alerte séparée par un moteur
+    concurrent.
 
     now : horodatage de référence (datetime), pour des tests déterministes.
     Par défaut : l'instant présent.
@@ -284,9 +292,7 @@ def evaluate(alerts, temporal_chains=None, now=None):
 
     windowed.sort(key=lambda a: a.get("timestamp") or "")
     source_ids = [a["id"] for a in windowed if a.get("id")]
-    agent_label = next(
-        (a.get("agent_id") for a in reversed(alerts) if a.get("agent_id")), "?"
-    )
+    agent_label = agent_id or "?"
 
     details = []
     temporal_chain_used = False

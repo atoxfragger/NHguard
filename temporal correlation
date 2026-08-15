@@ -95,10 +95,43 @@ TEMPORAL_PATTERNS = [
     },
 ]
 
-# Fenêtre maximale parmi tous les motifs : sert de référence à l'appelant
-# pour savoir jusqu'où remonter dans process_events (voir
-# db_data.get_recent_process_events_for_agent).
-MAX_WINDOW_MINUTES = max(p["window_seconds"] for p in TEMPORAL_PATTERNS) // 60
+# Motifs pour le flux d'évènements CONTINU (voir event_schema.py /
+# db_data.get_recent_raw_events_for_agent) — vocabulaire plus riche que
+# TEMPORAL_PATTERNS (process_start, network_connect, dns_query,
+# persistence_created...), puisqu'il ne dépend plus de ce qu'une
+# détection choisit de faire remonter, mais de tout ce que les
+# collecteurs de edr_agent.py observent en continu. Fenêtres plus courtes
+# que TEMPORAL_PATTERNS : chaque "étape" ici est un évènement réel et
+# individuellement horodaté (pas l'instantané d'une détection), donc un
+# épisode cohérent se joue naturellement sur une échelle de temps plus
+# resserrée.
+RAW_TEMPORAL_PATTERNS = [
+    {
+        "id": "RTC-001",
+        "name": "Exécution suivie d'une persistance puis d'une connexion réseau",
+        "steps": ["process_start", "persistence_created", "network_connect"],
+        "window_seconds": 10 * 60,
+    },
+    {
+        "id": "RTC-002",
+        "name": "Connexion réseau suivie d'une nouvelle exécution (téléchargement puis lancement)",
+        "steps": ["network_connect", "process_start"],
+        "window_seconds": 5 * 60,
+    },
+    {
+        "id": "RTC-003",
+        "name": "Résolution DNS suivie d'une connexion réseau",
+        "steps": ["dns_query", "network_connect"],
+        "window_seconds": 2 * 60,
+    },
+]
+
+# Fenêtre maximale parmi TOUS les motifs (legacy + flux continu) : sert de
+# référence à l'appelant pour savoir jusqu'où remonter dans process_events
+# et dans la table events (voir db_data.get_recent_*_for_agent).
+MAX_WINDOW_MINUTES = max(
+    p["window_seconds"] for p in TEMPORAL_PATTERNS + RAW_TEMPORAL_PATTERNS
+) // 60
 
 # En dessous de cette complétude (fraction d'étapes du motif satisfaites),
 # une correspondance partielle n'est pas jugée assez significative.
@@ -283,7 +316,9 @@ def correlate(events):
     """events : tous les process_events RÉCENTS d'UNE SEULE machine
     (déjà filtrés par agent_id et par MAX_WINDOW_MINUTES côté appelant —
     voir db_data.get_recent_process_events_for_agent), dans n'importe
-    quel ordre, toutes détections/alert_id confondus.
+    quel ordre, toutes détections/alert_id confondus. Utilise
+    TEMPORAL_PATTERNS (vocabulaire "process"/"file"/"network" hérité des
+    instantanés de détection — voir l'en-tête du module).
 
     Retourne la liste des chaînes détectées (une par motif × arbre de
     processus où une correspondance suffisante a été trouvée, plus
@@ -291,6 +326,48 @@ def correlate(events):
     confiance décroissante. Liste vide — le cas normal, largement
     majoritaire — si rien d'assez significatif n'a été trouvé.
     """
+    return _correlate_with_patterns(events, TEMPORAL_PATTERNS)
+
+
+def _normalize_raw_event(ev):
+    """Adapte une ligne de la table `events` (télémétrie continue — voir
+    db_data.get_recent_raw_events_for_agent) au format interne partagé
+    par ce module (pid/parent_pid/event_type/alert_id/timestamp/id), le
+    même que process_events, pour réutiliser TOUTE la mécanique de
+    corrélation existante (_process_tree_groups, _batches, _match_pattern)
+    sans la dupliquer.
+
+    alert_id = event_id : chaque évènement de la file continue porte déjà
+    un horodatage réel et individuel (contrairement à un instantané de
+    détection où plusieurs lignes partagent la même seconde — voir
+    l'en-tête du module) — il est donc, à lui seul, SA PROPRE "détection"
+    au sens de _batches()/_match_pattern() : deux évènements distincts ne
+    partagent jamais le même event_id, donc la garantie "chaque étape
+    matchée vient d'une source distincte" (qui empêchait un faux positif
+    à partir d'un seul instantané) reste satisfaite par construction,
+    sans code supplémentaire."""
+    return {
+        "id": ev.get("event_id"),
+        "alert_id": ev.get("event_id"),
+        "pid": ev.get("pid"),
+        "parent_pid": ev.get("ppid"),
+        "event_type": ev.get("event_type"),
+        "timestamp": ev.get("timestamp"),
+    }
+
+
+def correlate_raw_events(events):
+    """events : lignes RÉCENTES de la table `events` (télémétrie continue,
+    voir db_data.get_recent_raw_events_for_agent) d'UNE SEULE machine,
+    dans n'importe quel ordre. Utilise RAW_TEMPORAL_PATTERNS (vocabulaire
+    process_start/network_connect/dns_query/persistence_created...) —
+    c'est le point d'entrée "Raw Events -> Temporal Correlator" du
+    pipeline (voir behaviour_engine.py, en-tête du module, et
+    edr_server.py:_run_behavior_correlation)."""
+    return _correlate_with_patterns([_normalize_raw_event(ev) for ev in events], RAW_TEMPORAL_PATTERNS)
+
+
+def _correlate_with_patterns(events, patterns):
     if not events:
         return []
 
@@ -302,7 +379,7 @@ def correlate(events):
         batches = _batches(group)
         if len(batches) < 2:
             continue
-        for pattern in TEMPORAL_PATTERNS:
+        for pattern in patterns:
             matched = _match_pattern(pattern, batches)
             if not matched:
                 continue
@@ -316,7 +393,7 @@ def correlate(events):
     # remonté à un niveau de preuve plus fort.
     host_batches = _batches(events)
     if len(host_batches) >= 2:
-        for pattern in TEMPORAL_PATTERNS:
+        for pattern in patterns:
             if pattern["id"] in patterns_matched_by_tree:
                 continue
             matched = _match_pattern(pattern, host_batches)

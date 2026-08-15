@@ -20,6 +20,8 @@ Lancement :
     python edr_server.py
 """
 
+import gzip
+import json
 import os
 import random
 import secrets
@@ -40,6 +42,7 @@ import risk_engine
 import behaviour_engine
 import temporal_correlator
 import process_tree
+import event_schema
 
 app = Flask(__name__)
 CORS(app)
@@ -360,8 +363,50 @@ def agent_report():
         geo_city=data.get("geo_city"),
         geo_region=data.get("geo_region"),
         geo_country=data.get("geo_country"),
+        queue_size=data.get("queue_size", 0),
+        agent_uptime=data.get("agent_uptime", 0),
+        collector_health=data.get("collector_health"),
     )
     return jsonify({"success": True})
+
+
+@app.route("/api/agents/events", methods=["POST"])
+@require_agent_key
+def agent_events():
+    """Ingestion de la télémétrie continue (voir event_schema.py côté
+    agent) — un LOT compressé, pas un évènement par requête (document
+    source, section 17). Ne fait jamais confiance aveuglément à ce
+    qu'envoie l'agent (section 20) : chaque évènement du lot est validé
+    individuellement, un évènement malformé est ignoré (compté, jamais
+    silencieusement fatal pour le reste du lot)."""
+    raw = request.get_data()
+    if request.headers.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            return jsonify({"error": "Corps gzip invalide"}), 400
+    try:
+        events = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return jsonify({"error": "JSON invalide"}), 400
+    if not isinstance(events, list):
+        return jsonify({"error": "Un tableau d'évènements est attendu"}), 400
+
+    valid_events, rejected = [], 0
+    for ev in events:
+        ok, _reason = event_schema.validate_event(ev)
+        if ok:
+            valid_events.append(ev)
+        else:
+            rejected += 1
+
+    if valid_events:
+        db_data.create_raw_events(request.org_id, valid_events)
+        agent_ids = {ev["host"]["id"] for ev in valid_events if ev.get("host", {}).get("id")}
+        for agent_id in agent_ids:
+            _run_behavior_correlation(request.org_id, agent_id)
+
+    return jsonify({"success": True, "accepted": len(valid_events), "rejected": rejected}), 201
 
 
 def _run_behavior_correlation(org_id, agent_id):
@@ -372,9 +417,12 @@ def _run_behavior_correlation(org_id, agent_id):
     (behaviour_engine sur l'historique d'alertes, temporal_correlator sur
     les process_events), produisant deux catégories d'alerte séparées
     ("comportemental" / "chaine_temporelle") qui ne se recoupaient jamais.
-    Les deux routes appellent maintenant CETTE fonction : les chaînes
-    temporelles sont une ENTRÉE du Behaviour Engine, pas un moteur
-    concurrent — une seule alerte de synthèse en résulte, jamais deux."""
+    Toutes les routes d'ingestion appellent maintenant CETTE fonction :
+    les chaînes temporelles — qu'elles viennent des instantanés de
+    détection (process_events) OU du flux de télémétrie continue (table
+    events, voir agent_events()) — sont une ENTRÉE du Behaviour Engine,
+    pas un moteur concurrent : une seule alerte de synthèse en résulte,
+    jamais deux."""
     if not agent_id or db_data.has_recent_alert_of_category(
         org_id, agent_id, "comportemental", behaviour_engine.CORRELATION_COOLDOWN_MINUTES
     ):
@@ -386,9 +434,15 @@ def _run_behavior_correlation(org_id, agent_id):
     recent_events = db_data.get_recent_process_events_for_agent(
         org_id, agent_id, temporal_correlator.MAX_WINDOW_MINUTES
     )
-    temporal_chains = temporal_correlator.correlate(recent_events)
+    recent_raw_events = db_data.get_recent_raw_events_for_agent(
+        org_id, agent_id, temporal_correlator.MAX_WINDOW_MINUTES
+    )
+    temporal_chains = (
+        temporal_correlator.correlate(recent_events)
+        + temporal_correlator.correlate_raw_events(recent_raw_events)
+    )
 
-    verdict = behaviour_engine.evaluate(recent_alerts, temporal_chains=temporal_chains)
+    verdict = behaviour_engine.evaluate(recent_alerts, agent_id=agent_id, temporal_chains=temporal_chains)
     if verdict:
         db_data.create_alert(
             org_id=org_id,

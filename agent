@@ -48,6 +48,7 @@ le résultat "failed" est rapporté au serveur.
 
 import ctypes
 from ctypes import wintypes
+import gzip
 import hashlib
 import json
 import os
@@ -62,6 +63,8 @@ import time
 import psutil
 import requests
 
+import event_queue
+import event_schema
 import process_scoring
 
 APP_NAME = "EDRAgent"
@@ -126,6 +129,7 @@ _already_alerted = set()
 _hash_cache = {}   # chemin de fichier -> hash SHA-256 (évite de re-hasher à chaque cycle)
 _iocs_cache = {"hash": {}, "ip": {}, "cmdline_pattern": []}
 _cycle_count = 0
+_agent_start_time = time.time()
 
 
 # ──────────────────────────────────────────────────────────
@@ -315,6 +319,14 @@ def collect_system_stats(agent_id):
         "geo_country": geo.get("country"),
         "logged_in_user": get_logged_in_user(),
         "processes": get_top_processes(),
+        # Santé de la télémétrie (document source, section 18-19) : sans
+        # ça, un collecteur qui plante silencieusement pourrait laisser
+        # croire "aucune attaque" alors qu'il ne collecte plus rien —
+        # un point de sécurité majeur, pas un détail de supervision.
+        "agent_uptime": round(time.time() - _agent_start_time),
+        "queue_size": event_queue.queue_size(),
+        "collector_health": dict(_collector_health),
+        "dropped_events": event_queue.pop_dropped_counts(),
     }
 
 
@@ -332,6 +344,38 @@ def send_heartbeat(cfg, stats):
             print(f"[!] Erreur heartbeat ({r.status_code}) : {r.text}")
     except requests.RequestException as e:
         print(f"[!] Serveur injoignable : {e}")
+
+
+def flush_event_queue(cfg, max_batch=200):
+    """Vide la file locale par LOTS compressés (jamais une requête HTTP
+    par évènement, document source section 17) — Event -> Local Queue ->
+    Batch -> Compression -> TLS -> Server. Ne retire de la file QUE ce
+    que le serveur a confirmé avoir reçu (statut 201) : si l'envoi échoue
+    en cours de route (coupure réseau pendant le POST), tout reste en
+    attente pour le prochain cycle, rien n'est perdu."""
+    batch = event_queue.dequeue_batch(max_batch)
+    if not batch:
+        return
+    seqs = [seq for seq, _ in batch]
+    events = [ev for _, ev in batch]
+    try:
+        payload = gzip.compress(json.dumps(events).encode("utf-8"))
+    except (TypeError, ValueError) as e:
+        print(f"[!] Lot d'évènements invalide, abandonné : {e}")
+        return
+
+    headers = {
+        "Content-Type": "application/json", "Content-Encoding": "gzip",
+        "X-Agent-Key": cfg["api_key"],
+    }
+    try:
+        r = requests.post(f"{cfg['server_url']}/api/agents/events", data=payload, headers=headers, timeout=10)
+        if r.status_code == 201:
+            event_queue.mark_sent(seqs)
+        else:
+            print(f"[!] Erreur envoi évènements ({r.status_code}) : {r.text}")
+    except requests.RequestException as e:
+        print(f"[!] Serveur injoignable pour l'envoi d'évènements : {e}")
 
 
 def send_alert(cfg, title, description, severity, category, signals=None):
@@ -766,6 +810,7 @@ def hash_file(path, chunk_size=65536):
 _IS_WINDOWS = platform.system() == "Windows"
 
 if _IS_WINDOWS:
+    import winreg  # module stdlib Windows uniquement — jamais importable sur Linux/macOS
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     _wintrust = ctypes.WinDLL("wintrust")
@@ -1109,9 +1154,294 @@ def scan_processes(cfg):
                 pass
 
 
+# ──────────────────────────────────────────────────────────
+# Collecteurs de télémétrie CONTINUE — indépendants de toute détection,
+# contrairement à scan_processes() ci-dessus (qui ne s'active que sur un
+# comportement déjà jugé suspect). Ici : "voici ce qui s'est passé", pas
+# "voici ce qui est malveillant" — la décision reste entièrement au
+# serveur (Temporal Correlator -> Behaviour Engine -> Risk Engine).
+#
+# Limite assumée : cet agent tourne en espace utilisateur pur, sans hook
+# noyau/ETW ni pilote filtre. Les collecteurs ci-dessous fonctionnent donc
+# par COMPARAISON D'INSTANTANÉS entre deux cycles (toutes les
+# REPORT_INTERVAL_SECONDS) plutôt qu'en vrai temps réel :
+#   - Process, Réseau, Registre (persistance), Utilisateur/session : cette
+#     approche capture correctement les évènements qui durent au moins un
+#     cycle, ce qui couvre la quasi-totalité des cas utiles pour la
+#     détection à l'échelle de temps de temporal_correlator.py.
+#   - PAS de collecteur Fichiers ni DNS applicatif ici : un vrai suivi
+#     temps réel du système de fichiers demanderait une dépendance
+#     supplémentaire (ex: watchdog/ReadDirectoryChangesW) avec un vrai
+#     travail de calibrage (quels dossiers surveiller, exclusions, volume)
+#     qui n'a pas été fait ni testé — mieux vaut l'annoncer clairement que
+#     livrer un collecteur qui ne surveille en réalité presque rien. La
+#     visibilité DNS ci-dessous (collect_network_events) n'est qu'un
+#     PROXY : elle voit qu'une connexion vers le port 53 a eu lieu, pas
+#     le nom de domaine résolu (ça demanderait un hook du résolveur ou
+#     une capture de paquets).
+# ──────────────────────────────────────────────────────────
+
+# None (pas encore de référence) plutôt que set() vide : sur le tout
+# premier cycle, il ne faut PAS traiter "tous les processus déjà en cours"
+# comme des "process_start" — ce serait une rafale de faux évènements de
+# démarrage pour des processus qui tournaient déjà avant l'agent.
+_prev_pids = None
+_prev_connections = None
+_prev_registry_snapshot = None
+_prev_users = None
+
+_collector_health = {"process": "healthy", "network": "healthy", "registry": "healthy", "user": "healthy"}
+
+_SECRET_CMDLINE_PATTERN = re.compile(
+    r"(?i)(password|passwd|pwd|secret|token|apikey|api[_-]?key|access[_-]?key)(\s*[=:]\s*)(\S+)"
+)
+
+
+def redact_cmdline(cmdline):
+    """Masque les valeurs ressemblant à un mot de passe/jeton dans une
+    ligne de commande avant sa mise en file — les lignes de commande
+    peuvent contenir des secrets (cf. document source, section 9). Ne
+    touche PAS aux motifs base64/-enc des interpréteurs : c'est justement
+    ce contenu qui a une valeur de détection, à ne pas effacer."""
+    if not cmdline:
+        return cmdline
+    return _SECRET_CMDLINE_PATTERN.sub(r"\1\2***REDACTED***", cmdline)
+
+
+def collect_process_events(cfg):
+    """process_start / process_exit en continu, par différence avec
+    l'instantané du cycle précédent (voir note de section ci-dessus)."""
+    global _prev_pids
+    current = {}
+    try:
+        for p in psutil.process_iter(["pid"]):
+            current[p.info["pid"]] = p
+    except Exception:
+        _collector_health["process"] = "stalled"
+        return
+    _collector_health["process"] = "healthy"
+
+    current_pids = set(current.keys())
+    if _prev_pids is None:
+        _prev_pids = current_pids
+        return
+
+    for pid in current_pids - _prev_pids:
+        proc = current.get(pid)
+        if proc is None:
+            continue
+        try:
+            name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        try:
+            ppid = proc.ppid()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            ppid = None
+        try:
+            path = proc.exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            path = None
+        try:
+            user = proc.username()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            user = None
+        try:
+            cmdline = redact_cmdline(" ".join(proc.cmdline()))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cmdline = None
+
+        ev = event_schema.make_event(
+            "process_start", cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": pid, "ppid": ppid, "user": user},
+            data={
+                "process": name, "path": path, "command_line": cmdline,
+                "integrity_level": get_integrity_level(pid),
+                "session_id": get_session_id(pid),
+                "signed": is_authenticode_signed(path) if path else None,
+            },
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    for pid in _prev_pids - current_pids:
+        ev = event_schema.make_event(
+            "process_exit", cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": pid, "ppid": None, "user": None}, data={},
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    _prev_pids = current_pids
+
+
+def collect_network_events(cfg):
+    """network_connect en continu (proxy DNS sur le port 53 — voir note de
+    section ci-dessus), par différence de connexions actives."""
+    global _prev_connections
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except Exception:
+        _collector_health["network"] = "stalled"
+        return
+    _collector_health["network"] = "healthy"
+
+    current = {}
+    for c in conns:
+        if not c.raddr or not c.laddr:
+            continue
+        key = (c.pid, c.laddr.ip, c.laddr.port, c.raddr.ip, c.raddr.port)
+        current[key] = c
+
+    current_keys = set(current.keys())
+    if _prev_connections is None:
+        _prev_connections = current_keys
+        return
+
+    for key in current_keys - _prev_connections:
+        c = current[key]
+        pid, src_ip, src_port, dst_ip, dst_port = key
+        proc_name = None
+        if pid:
+            try:
+                proc_name = psutil.Process(pid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        event_type = "dns_query" if dst_port == 53 else "network_connect"
+        ev = event_schema.make_event(
+            event_type, cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": pid, "ppid": None, "user": None},
+            data={
+                "process": proc_name,
+                "protocol": "UDP" if c.type == socket.SOCK_DGRAM else "TCP",
+                "source_ip": src_ip, "source_port": src_port,
+                "destination_ip": dst_ip, "destination_port": dst_port,
+            },
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    _prev_connections = current_keys
+
+
+# Clés de démarrage automatique classiques — mêmes emplacements que ceux
+# qu'un attaquant utilise le plus souvent pour la persistance (cf.
+# document source, section 7 : "Run, RunOnce, Services, Policies,
+# Winlogon" — Services/Policies/Winlogon nécessitent des clés
+# supplémentaires plus larges, laissées à une itération future pour ne
+# pas élargir la surveillance sans l'avoir calibrée).
+_PERSISTENCE_KEYS = [
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+] if _IS_WINDOWS else []
+
+_REGISTRY_HIVES = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER} if _IS_WINDOWS else {}
+
+
+def _read_registry_values(hive_name, subkey):
+    values = {}
+    try:
+        with winreg.OpenKey(_REGISTRY_HIVES[hive_name], subkey) as key:
+            i = 0
+            while True:
+                try:
+                    name, data, _ = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                values[name] = str(data)
+                i += 1
+    except OSError:
+        pass  # clé absente (normal, toutes les clés ne sont pas toujours créées) — pas un signal
+    return values
+
+
+def _emit_persistence_event(cfg, event_type, key_path, value_name, value_data):
+    ev = event_schema.make_event(
+        event_type, cfg["agent_id"], event_queue.next_seq(),
+        data={"method": "registry_run_key", "key": key_path, "name": value_name, "value": value_data},
+        os_name=platform.system(),
+    )
+    event_queue.enqueue(ev)
+
+
+def collect_persistence_events(cfg):
+    """Compare un instantané des clés Run/RunOnce au cycle précédent —
+    polling périodique, PAS un vrai hook temps réel (RegNotifyChangeKeyValue),
+    suffisant à l'échelle de REPORT_INTERVAL_SECONDS (voir note de section
+    plus haut). Une modification n'est PAS jugée malveillante ici — c'est
+    de la télémétrie, exactement comme pour les modifications de fichiers
+    (document source, section 7 : "ne considère pas automatiquement une
+    modification du Registry comme malveillante")."""
+    if not _IS_WINDOWS:
+        return
+    global _prev_registry_snapshot
+    try:
+        snapshot = {
+            f"{hive}\\{subkey}": _read_registry_values(hive, subkey)
+            for hive, subkey in _PERSISTENCE_KEYS
+        }
+    except Exception:
+        _collector_health["registry"] = "stalled"
+        return
+    _collector_health["registry"] = "healthy"
+
+    if _prev_registry_snapshot is None:
+        _prev_registry_snapshot = snapshot
+        return
+
+    for label, values in snapshot.items():
+        prev_values = _prev_registry_snapshot.get(label, {})
+        for name, data in values.items():
+            if name not in prev_values:
+                _emit_persistence_event(cfg, "persistence_created", label, name, data)
+            elif prev_values[name] != data:
+                _emit_persistence_event(cfg, "persistence_modified", label, name, data)
+        for name in prev_values:
+            if name not in values:
+                _emit_persistence_event(cfg, "persistence_removed", label, name, None)
+
+    _prev_registry_snapshot = snapshot
+
+
+def collect_user_events(cfg):
+    """user_login / user_logout en continu, par différence de sessions
+    utilisateur actives (voir note de section plus haut)."""
+    global _prev_users
+    try:
+        users = {(u.name, u.terminal) for u in psutil.users()}
+    except Exception:
+        _collector_health["user"] = "stalled"
+        return
+    _collector_health["user"] = "healthy"
+
+    if _prev_users is None:
+        _prev_users = users
+        return
+
+    for name, terminal in users - _prev_users:
+        ev = event_schema.make_event(
+            "user_login", cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": None, "ppid": None, "user": name},
+            data={"terminal": terminal}, os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+    for name, terminal in _prev_users - users:
+        ev = event_schema.make_event(
+            "user_logout", cfg["agent_id"], event_queue.next_seq(),
+            actor={"pid": None, "ppid": None, "user": name},
+            data={"terminal": terminal}, os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+    _prev_users = users
+
+
 def main():
     global _cycle_count
     cfg = get_config()
+    event_queue.init_db()
     print("── Agent NHGuard démarré ──")
     print(f"Identifiant : {cfg['agent_id']}")
     print(f"Serveur     : {cfg['server_url']}")
@@ -1122,6 +1452,15 @@ def main():
     fetch_iocs(cfg)
 
     while True:
+        # Collecteurs de télémétrie continue AVANT le heartbeat, pour que
+        # queue_size/collector_health reflètent ce cycle-ci et non le
+        # précédent (voir collect_system_stats).
+        collect_process_events(cfg)
+        collect_network_events(cfg)
+        collect_persistence_events(cfg)
+        collect_user_events(cfg)
+        flush_event_queue(cfg)
+
         stats = collect_system_stats(cfg["agent_id"])
         send_heartbeat(cfg, stats)
         scan_processes(cfg)
@@ -1132,7 +1471,8 @@ def main():
             fetch_iocs(cfg)
 
         print(f"[{time.strftime('%H:%M:%S')}] CPU {stats['cpu_percent']}% · "
-              f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}%")
+              f"RAM {stats['ram_percent']}% · Disque {stats['disk_percent']}% · "
+              f"File {stats['queue_size']}")
         time.sleep(REPORT_INTERVAL_SECONDS)
 
 

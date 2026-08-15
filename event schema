@@ -1,0 +1,131 @@
+"""
+event_schema.py — Format d'évènement commun à toute la télémétrie NHGuard.
+
+Partagé entre edr_agent.py (qui produit les évènements) et edr_server.py
+(qui les valide à l'entrée) — l'intérêt d'un schéma commun est que TOUS
+les moteurs qui consomment ensuite ces évènements (temporal_correlator.py,
+behaviour_engine.py, risk_engine.py, une future recherche/hunting) parlent
+le même langage, plutôt que chaque collecteur inventant son propre format
+ad hoc. Voir edr_agent.py pour les collecteurs eux-mêmes (process, réseau,
+persistance registre, utilisateur/session) et event_queue.py pour la file
+locale qui stocke ces évènements avant envoi.
+
+Enveloppe commune :
+    {
+      "event_id": uuid4,          -- unique, sert à la déduplication et à l'audit
+      "schema_version": 1,
+      "timestamp": ISO 8601 UTC (même format que le reste de NHGuard :
+                    datetime.utcnow().isoformat(timespec="seconds")),
+      "seq": int,                 -- compteur monotone PAR MACHINE (voir
+                                      event_queue.py:next_seq), permet de
+                                      détecter un trou côté serveur si le
+                                      réseau a coupé entre deux séquences
+      "host": {"id": str, "os": str},
+      "actor": {"pid": int|None, "ppid": int|None, "user": str|None},
+      "event": {"type": str, "priority": "P0"|"P1"|"P2"|"P3"},
+      "data": {...spécifique au type d'évènement...},
+    }
+
+Ce module ne décide jamais de la sévérité d'un évènement — il décrit
+seulement CE QUI S'EST PASSÉ, au format attendu par la suite du pipeline
+(cf. principe du document source : "l'agent ne doit pas décider si
+quelque chose est malveillant").
+"""
+
+import uuid
+from datetime import datetime
+
+SCHEMA_VERSION = 1
+
+# ──────────────────────────────────────────────────────────
+# Priorités par type d'évènement — sert au backpressure de la file locale
+# (event_queue.py) : sous forte charge, on déleste des P3 puis des P2,
+# JAMAIS de P0/P1 (voir event_queue.py:apply_backpressure), et chaque
+# suppression est comptée, jamais silencieuse.
+# ──────────────────────────────────────────────────────────
+EVENT_PRIORITY = {
+    # P0 — critique : le comportement de l'agent ou des protections lui-même
+    "process_tampering":     "P0",
+    "protection_modified":   "P0",
+    # P1 — important : ce qui alimente le plus directement la détection
+    "process_start":         "P1",
+    "network_connect":       "P1",
+    "persistence_created":   "P1",
+    "persistence_modified":  "P1",
+    # P2 — normal
+    "process_exit":          "P2",
+    "persistence_removed":   "P2",
+    "file_create":           "P2",
+    "file_modify":           "P2",
+    "file_delete":           "P2",
+    "user_login":            "P2",
+    # P3 — faible : informationnel
+    "user_logout":           "P3",
+    "session_start":         "P3",
+    "session_end":           "P3",
+}
+DEFAULT_PRIORITY = "P2"
+
+REQUIRED_TOP_LEVEL = ("event_id", "schema_version", "timestamp", "seq", "host", "event", "data")
+
+
+def now_iso():
+    """Même format que le reste de NHGuard (voir db_data.py) — pour que
+    tous les timestamps du produit se comparent/trient comme des chaînes
+    sans conversion, y compris entre la table `events` et `alerts`."""
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def make_event(event_type, host_id, seq, data=None, actor=None, os_name=None):
+    """Construit un évènement conforme à l'enveloppe commune.
+
+    event_type : ex. "process_start", "network_connect"...
+    host_id : identifiant de la machine (agent_id)
+    seq : numéro de séquence monotone PAR MACHINE (voir event_queue.next_seq)
+    data : dict spécifique au type d'évènement (ex: {"pid", "process",
+           "path", "command_line", ...} pour process_start)
+    actor : dict optionnel {"pid", "ppid", "user"} — le processus à
+            l'origine de l'évènement, quand pertinent
+    os_name : platform.system(), pour host.os
+    """
+    return {
+        "event_id": str(uuid.uuid4()),
+        "schema_version": SCHEMA_VERSION,
+        "timestamp": now_iso(),
+        "seq": seq,
+        "host": {"id": host_id, "os": (os_name or "").lower()},
+        "actor": actor or {},
+        "event": {"type": event_type, "priority": EVENT_PRIORITY.get(event_type, DEFAULT_PRIORITY)},
+        "data": data or {},
+    }
+
+
+def validate_event(event):
+    """Validation minimale côté SERVEUR — ne fait jamais confiance
+    aveuglément à ce qu'envoie l'agent (cf. document source, section 20 :
+    "Event -> validation -> schema validation -> authentication ->
+    storage"). Retourne (True, None) si l'évènement est exploitable,
+    (False, raison) sinon — un évènement rejeté ne doit jamais faire
+    planter l'ingestion du reste du lot (voir edr_server.py)."""
+    if not isinstance(event, dict):
+        return False, "évènement n'est pas un objet JSON"
+
+    missing = [f for f in REQUIRED_TOP_LEVEL if f not in event]
+    if missing:
+        return False, f"champs manquants : {', '.join(missing)}"
+
+    if event.get("schema_version") != SCHEMA_VERSION:
+        return False, f"schema_version {event.get('schema_version')!r} non supporté (attendu {SCHEMA_VERSION})"
+
+    ev = event.get("event")
+    if not isinstance(ev, dict) or not ev.get("type"):
+        return False, "event.type manquant"
+
+    host = event.get("host")
+    if not isinstance(host, dict) or not host.get("id"):
+        return False, "host.id manquant"
+
+    if not isinstance(event.get("data"), dict):
+        return False, "data doit être un objet"
+
+    return True, None

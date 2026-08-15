@@ -1,0 +1,192 @@
+"""
+event_queue.py — File d'attente locale persistante pour la télémétrie de
+l'agent NHGuard (voir event_schema.py pour le format des évènements).
+
+Sans cette file : Event -> Internet -> Server. Si le réseau tombe, les
+évènements produits pendant la coupure sont perdus. Avec elle :
+Event -> Local Queue -> (attente/reconnexion) -> Server — rien n'est
+perdu tant que la file elle-même survit (fichier SQLite sur disque,
+%APPDATA%\\EDRAgent\\queue.db, donc résiste aussi à un redémarrage de
+l'agent, pas seulement à une coupure réseau).
+
+Cette file porte aussi le compteur de séquence par machine (next_seq) —
+puisqu'il doit rester cohérent entre deux exécutions de l'agent, il vit
+au même endroit que les évènements eux-mêmes plutôt que dans un fichier
+séparé.
+
+Backpressure (section 15 du document source) : sous forte charge, on
+déleste les évènements les MOINS prioritaires en premier (P3 puis P2),
+jamais les P0/P1 — et chaque suppression est comptée (pop_dropped_counts),
+jamais silencieuse : un agent qui perdrait des évènements sans le signaler
+pourrait laisser croire "aucune attaque" alors qu'il ne collecte plus
+rien (cf. document source, section 19 — un point de sécurité majeur).
+"""
+
+import json
+import os
+import platform
+import sqlite3
+import time
+from contextlib import contextmanager
+
+APP_NAME = "EDRAgent"
+
+# Seuils de backpressure : au-delà de SOFT_LIMIT évènements en attente,
+# les nouveaux P3 sont délestés ; au-delà de HARD_LIMIT, les P2 aussi.
+# ABSOLUTE_CEILING est un dernier recours (serveur injoignable pendant
+# très longtemps) : purge les P2/P3 déjà en file, jamais les P0/P1.
+SOFT_LIMIT = 5000
+HARD_LIMIT = 20000
+ABSOLUTE_CEILING = 100000
+
+
+def _app_data_dir():
+    if platform.system() == "Windows":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    folder = os.path.join(base, APP_NAME)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _db_path():
+    return os.path.join(_app_data_dir(), "queue.db")
+
+
+@contextmanager
+def _connection():
+    conn = sqlite3.connect(_db_path(), timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with _connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS queue (
+                seq        INTEGER PRIMARY KEY,
+                priority   TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_priority ON queue(priority, seq)")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+
+
+def _meta_get(conn, key, default=0):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return int(row["value"]) if row else default
+
+
+def _meta_set(conn, key, value):
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+
+
+def next_seq():
+    """Numéro de séquence monotone, PERSISTÉ (survit un redémarrage de
+    l'agent) — voir event_schema.py, champ "seq". Sert côté serveur à
+    repérer un trou dans la numérotation si le réseau a coupé entre deux
+    évènements (document source, section 13)."""
+    with _connection() as conn:
+        nxt = _meta_get(conn, "next_seq", 0) + 1
+        _meta_set(conn, "next_seq", nxt)
+        return nxt
+
+
+def _increment_dropped(conn, label):
+    _meta_set(conn, f"dropped_{label}", _meta_get(conn, f"dropped_{label}", 0) + 1)
+
+
+def enqueue(event):
+    """Ajoute un évènement (déjà au format event_schema.make_event()) à
+    la file, après application du backpressure. Retourne True si mis en
+    file, False s'il a été délesté (jamais silencieusement : voir
+    pop_dropped_counts, à inclure dans le prochain heartbeat)."""
+    priority = event.get("event", {}).get("priority", "P2")
+    with _connection() as conn:
+        size = conn.execute("SELECT COUNT(*) c FROM queue").fetchone()["c"]
+
+        if size >= HARD_LIMIT and priority in ("P2", "P3"):
+            _increment_dropped(conn, priority.lower())
+            return False
+        if size >= SOFT_LIMIT and priority == "P3":
+            _increment_dropped(conn, priority.lower())
+            return False
+        if size >= ABSOLUTE_CEILING:
+            _purge_oldest_low_priority(conn)
+
+        conn.execute(
+            "INSERT INTO queue (seq, priority, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (event["seq"], priority, event.get("event", {}).get("type", "?"),
+             json.dumps(event), time.time()),
+        )
+        return True
+
+
+def _purge_oldest_low_priority(conn, limit=1000):
+    """Dernier recours si la file dépasse ABSOLUTE_CEILING malgré le
+    backpressure normal (ex: serveur injoignable pendant des jours) :
+    purge les P2/P3 les plus anciens. Ne touche JAMAIS aux P0/P1."""
+    rows = conn.execute(
+        "SELECT seq FROM queue WHERE priority IN ('P2','P3') ORDER BY seq LIMIT ?", (limit,)
+    ).fetchall()
+    if not rows:
+        return
+    for _ in rows:
+        _increment_dropped(conn, "purged")
+    conn.executemany("DELETE FROM queue WHERE seq = ?", [(r["seq"],) for r in rows])
+
+
+def dequeue_batch(max_n=100):
+    """Jusqu'à max_n évènements par ordre de PRIORITÉ (P0 d'abord), puis
+    d'arrivée au sein d'une même priorité — sans les retirer de la file
+    (voir mark_sent, à appeler seulement après un envoi confirmé)."""
+    with _connection() as conn:
+        rows = conn.execute("""
+            SELECT seq, payload FROM queue
+            ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, seq
+            LIMIT ?
+        """, (max_n,)).fetchall()
+        return [(r["seq"], json.loads(r["payload"])) for r in rows]
+
+
+def mark_sent(seqs):
+    """Retire de la file les évènements dont l'envoi a été CONFIRMÉ
+    (réponse serveur 2xx) — jamais avant, pour ne rien perdre si l'envoi
+    échoue en cours de route (coupure réseau pendant le POST, etc.)."""
+    if not seqs:
+        return
+    with _connection() as conn:
+        conn.executemany("DELETE FROM queue WHERE seq = ?", [(s,) for s in seqs])
+
+
+def queue_size():
+    with _connection() as conn:
+        return conn.execute("SELECT COUNT(*) c FROM queue").fetchone()["c"]
+
+
+def pop_dropped_counts():
+    """Lit ET remet à zéro les compteurs de suppression (P2/P3 délestés
+    par backpressure, évènements purgés en dernier recours) — à inclure
+    dans le prochain heartbeat pour que ces pertes restent VISIBLES côté
+    dashboard plutôt que silencieuses (document source, section 19)."""
+    with _connection() as conn:
+        rows = conn.execute("SELECT key, value FROM meta WHERE key LIKE 'dropped_%'").fetchall()
+        counts = {r["key"][len("dropped_"):]: int(r["value"]) for r in rows}
+        if rows:
+            conn.executemany("DELETE FROM meta WHERE key = ?", [(r["key"],) for r in rows])
+        return counts
