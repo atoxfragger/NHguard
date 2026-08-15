@@ -76,6 +76,7 @@ EVENT_PRIORITY = {
     "queue_full":            "P0",
     "agent_unexpected_exit": "P0",  # émis par edr_watchdog.py, pas par l'agent lui-même
     "agent_tampered":        "P0",
+    "malware_blocked":       "P0",  # prévention EPP réussie (antivirus_engine.py) — ne doit jamais être perdu
 }
 DEFAULT_PRIORITY = "P2"
 

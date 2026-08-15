@@ -69,6 +69,7 @@ import time
 import psutil
 import requests
 
+import antivirus_engine
 import event_queue
 import event_schema
 import process_scoring
@@ -136,7 +137,7 @@ KNOWN_GOOD_PROCESSES = {
 
 _already_alerted = set()
 _hash_cache = {}   # chemin de fichier -> hash SHA-256 (évite de re-hasher à chaque cycle)
-_iocs_cache = {"hash": {}, "ip": {}, "cmdline_pattern": []}
+_iocs_cache = {"hash": {}, "ip": {}, "cmdline_pattern": [], "content_pattern": antivirus_engine.default_content_patterns()}
 _cycle_count = 0
 _agent_start_time = time.time()
 
@@ -587,7 +588,12 @@ def fetch_iocs(cfg):
         _iocs_cache["hash"] = hashes
         _iocs_cache["ip"] = ips
         _iocs_cache["cmdline_pattern"] = patterns
-        print(f"[IoC] {len(hashes)} hash, {len(ips)} IP, {len(patterns)} motifs chargés")
+        # content_pattern : voir antivirus_engine.load_content_patterns — le
+        # motif EICAR intégré reste TOUJOURS actif, même si cet appel échoue
+        # ou si l'organisation n'a configuré aucun IoC de ce type.
+        _iocs_cache["content_pattern"] = antivirus_engine.load_content_patterns(iocs)
+        print(f"[IoC] {len(hashes)} hash, {len(ips)} IP, {len(patterns)} motifs, "
+              f"{len(_iocs_cache['content_pattern'])} motifs de contenu chargés")
     except requests.RequestException as e:
         print(f"[!] Impossible de récupérer les IoC : {e}")
 
@@ -2133,6 +2139,48 @@ _FILE_ACTION_PHASE = {4: "old_name", 5: "new_name"}
 _file_change_queue = _queue.Queue()  # alimentée par les threads de surveillance, vidée par collect_file_events
 _file_watchers_started = False
 
+# ──────────────────────────────────────────────────────────
+# Couche EPP (prévention) — voir antivirus_engine.py pour le détail des
+# deux mécanismes de détection (hash IoC + motifs de contenu/EICAR).
+# _av_block_queue existe pour la MÊME raison que _file_change_queue :
+# le scan + la mise en quarantaine tournent DANS le thread de
+# surveillance (réaction immédiate, pas d'attente du cycle principal),
+# mais tout ce qui touche réseau/base (alerte, évènement) est repoussé
+# au thread principal via cette file thread-safe — aucun nouvel accès
+# concurrent à event_queue.py ou requests n'est introduit.
+# ──────────────────────────────────────────────────────────
+_av_block_queue = _queue.Queue()
+
+
+def _on_access_scan(path, action):
+    """Appelée DIRECTEMENT depuis le thread de surveillance, pas depuis
+    le cycle principal — la vitesse de réaction est tout l'intérêt de
+    cette fonction (voir docstring du module antivirus_engine). Ne
+    scanne que les créations/modifications (1, 3) : un fichier supprimé
+    ou renommé n'a plus besoin d'être bloqué à cet instant précis."""
+    if action not in (1, 3):
+        return
+    # Jamais scanner/mettre en quarantaine ses propres fichiers (queue.db,
+    # integrity.json, binaire mis en attente par check_for_update...) —
+    # même exclusion que collect_file_events, voir agent_data_dir().
+    own_data_dir = os.path.normcase(os.path.normpath(agent_data_dir()))
+    if os.path.normcase(os.path.normpath(path)).startswith(own_data_dir):
+        return
+    try:
+        verdict = antivirus_engine.scan_file_for_threats(
+            path, _iocs_cache.get("hash", {}), _iocs_cache.get("content_pattern", [])
+        )
+        if not verdict:
+            return
+        quarantine_path, moved = quarantine_file(path)
+        _av_block_queue.put((path, verdict, quarantine_path, moved))
+        print(f"[AV] Bloqué à l'écriture : {path} ({verdict['kind']})")
+    except Exception as e:
+        # Ce thread ne doit JAMAIS mourir à cause d'un scan qui échoue —
+        # la télémétrie fichier (voir _file_change_queue ci-dessous) doit
+        # continuer même si le scan EPP rencontre un problème inattendu.
+        print(f"[!] Scan EPP en échec pour {path} : {e}")
+
 
 def _watch_directory_thread(path):
     """Tourne en tâche de fond, UN thread PAR dossier surveillé : bloque
@@ -2140,7 +2188,9 @@ def _watch_directory_thread(path):
     d'OVERLAPPED/asynchrone ici, un thread dédié par dossier suffit vu le
     nombre restreint de dossiers surveillés) et empile chaque changement
     dans _file_change_queue pour que le cycle principal (non bloquant)
-    les transforme en évènements."""
+    les transforme en évènements. Scanne aussi chaque création/
+    modification pour la couche EPP (_on_access_scan) AVANT de l'empiler
+    — le blocage local ne doit pas attendre le prochain cycle."""
     h_dir = _kernel32.CreateFileW(
         path, _FILE_LIST_DIRECTORY, _FILE_SHARE_RWD, None,
         _OPEN_EXISTING, _FILE_FLAG_BACKUP_SEMANTICS, None,
@@ -2167,7 +2217,9 @@ def _watch_directory_thread(path):
             while True:
                 next_offset, action, name_len = struct.unpack_from("<III", raw, offset)
                 name = raw[offset + 12: offset + 12 + name_len].decode("utf-16-le", errors="replace")
-                _file_change_queue.put((action, os.path.join(path, name)))
+                full_path = os.path.join(path, name)
+                _on_access_scan(full_path, action)
+                _file_change_queue.put((action, full_path))
                 if next_offset == 0:
                     break
                 offset += next_offset
@@ -2287,6 +2339,57 @@ def collect_file_events(cfg):
                                      os.path.dirname(path), os.path.basename(path), path)
 
 
+def flush_av_block_queue(cfg):
+    """Vide _av_block_queue (voir _on_access_scan) : le blocage local
+    lui-même a déjà eu lieu, IMMÉDIATEMENT, dans le thread de
+    surveillance — cette fonction ne fait que remonter l'alerte et
+    l'évènement au serveur au cycle suivant. Même découplage que
+    collect_file_events : tout ce qui touche réseau/base reste dans le
+    thread principal."""
+    while True:
+        try:
+            path, verdict, quarantine_path, moved = _av_block_queue.get_nowait()
+        except _queue.Empty:
+            break
+
+        ioc = verdict["ioc"]
+        kind_label = "hash connu" if verdict["kind"] == "hash" else "motif de contenu"
+        description = ioc.get("description") or f"Correspond à un IoC de type {verdict['kind']}"
+        severity = ioc.get("severity", "high")
+
+        ev = event_schema.make_event(
+            "malware_blocked", cfg["agent_id"], event_queue.next_seq(),
+            data={
+                "path": path, "quarantine_path": quarantine_path, "file_moved": moved,
+                "detection_kind": verdict["kind"], "hash": verdict.get("hash"),
+                "description": description,
+            },
+            os_name=platform.system(),
+        )
+        event_queue.enqueue(ev)
+
+        # Volontairement SANS `signals=` : une correspondance IoC/EICAR est
+        # un verdict déjà définitif, pas un faisceau de signaux ambigus à
+        # soumettre au Risk Engine — dès que `signals` est fourni, le
+        # serveur ignore la `severity` de l'agent et recalcule la sienne
+        # (voir agent_alert() dans main serveur), ce qui écraserait la
+        # sévérité de l'IoC par un score "inconnu" proche de 0. La
+        # sévérité de l'IoC DOIT passer telle quelle.
+        alert_id = send_alert(
+            cfg, f"Fichier malveillant bloqué à l'écriture : {os.path.basename(path)}",
+            f"{description} — détecté par {kind_label} avant exécution probable",
+            severity, "antivirus",
+        )
+        send_quarantine(cfg, path, description, "antivirus_block", severity,
+                         quarantine_path=quarantine_path, file_moved=moved)
+        if alert_id:
+            send_process_events(cfg, alert_id, [{
+                "event_type": "file", "pid": None, "parent_pid": None,
+                "process_name": os.path.basename(path), "parent_name": None,
+                "detail": f"Fichier bloqué à l'écriture : {path}",
+            }])
+
+
 def main():
     global _cycle_count
     cfg = get_config()
@@ -2320,6 +2423,7 @@ def main():
         collect_scheduled_task_events(cfg)
         collect_user_events(cfg)
         collect_file_events(cfg)
+        flush_av_block_queue(cfg)
         emit_health_transition_events(cfg)
         check_queue_pressure(cfg)
         flush_event_queue(cfg)

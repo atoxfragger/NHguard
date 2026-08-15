@@ -1,0 +1,138 @@
+"""
+antivirus_engine.py — Couche EPP (prévention) de l'agent : scanne les
+fichiers À L'ÉCRITURE (au lieu de seulement les OBSERVER, comme le
+reste de la télémétrie continue) et bloque/met en quarantaine
+IMMÉDIATEMENT et LOCALEMENT, sans attendre de round-trip serveur.
+
+Différence avec ce qui existe déjà (voir edr_agent.py: scan_processes) :
+scan_processes() détecte un PROCESSUS déjà lancé, à chaque cycle de 15s
+(cadence du heartbeat) — un processus assez court peut donc s'exécuter
+et se terminer entre deux cycles sans jamais être vu (limitation déjà
+documentée et démontrée en direct dans cette session : voir la preuve
+demandée par l'utilisateur plus tôt). Ce module-ci scanne le FICHIER dès
+qu'il apparaît sur le disque, appelé directement depuis le thread de
+surveillance ReadDirectoryChangesW (voir _watch_directory_thread dans
+edr_agent.py) plutôt que d'attendre le prochain cycle de 15s — la
+détection ne dépend donc que de la latence de la notification Windows
+elle-même (typiquement sous la seconde), pas du cycle de heartbeat.
+
+Reste, comme le reste de l'agent, un mécanisme EN ESPACE UTILISATEUR :
+un vrai blocage AVANT que l'écriture du fichier ne soit terminée (comme
+le ferait un filtre minifilter noyau) N'EST PAS possible sans pilote
+signé — même limite déjà documentée pour la visibilité noyau (voir
+edr_agent.py). Ce module agit donc APRÈS écriture mais avant exécution
+probable : le fichier est mis en quarantaine dans la seconde qui suit
+son apparition, largement avant qu'un humain ou un script n'ait pu
+l'exécuter dans l'immense majorité des cas réels — une réduction
+sévère de la fenêtre d'exposition, pas une élimination totale. Mieux
+vaut annoncer cette limite clairement que prétendre à une protection
+qu'on ne peut pas tenir.
+
+Deux mécanismes de détection, volontairement AUCUNE base de signatures
+de malwares réelle fabriquée à la main : sans un vrai flux de threat
+intel derrière, une liste de signatures "maison" serait à la fois
+dangereuse à maintenir et trompeuse sur la couverture réelle offerte.
+  1. Hash SHA-256 contre le cache d'IoC déjà utilisé par scan_processes()
+     (même source, même fraîcheur — voir fetch_iocs() dans edr_agent.py).
+  2. Motifs de contenu ("content_pattern", nouveau type d'IoC) : un
+     YARA-lite configurable par l'organisation depuis le dashboard —
+     recherche d'une sous-chaîne dans les premiers CONTENT_SCAN_CAP_BYTES
+     du fichier (une SOUS-CHAÎNE littérale, pas une regex : appliqué au
+     contenu BRUT d'un fichier arbitraire, une regex admin serait un
+     risque de ReDoS ; une sous-chaîne reste largement suffisante pour
+     un signal statique). Inclut par défaut le test EICAR (voir
+     EICAR_TEST_STRING) : la chaîne de test standard de l'industrie
+     antivirus (eicar.org), 100% inoffensive (ce n'est PAS du code
+     exécutable), reconnue par tout antivirus légitime — sert ici à la
+     fois de détection prête à l'emploi et de moyen sûr de TESTER le
+     moteur en conditions réelles sans jamais manipuler de vrai malware.
+"""
+
+import hashlib
+import os
+
+# Chaîne de test standard de l'industrie antivirus (European Institute for
+# Computer Antivirus Research) — texte ASCII pur, aucune instruction
+# exécutable, publiée volontairement pour permettre de tester un
+# antivirus sans danger. Voir https://www.eicar.org/download-anti-malware-testfile/
+EICAR_TEST_STRING = (
+    r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+
+# Au-delà de cette taille, le fichier n'est ni hashé ni scanné pour motif
+# de contenu — voir _HASH_SIZE_CAP_BYTES dans edr_agent.py pour le même
+# raisonnement : un dropper malveillant fait presque toujours quelques
+# centaines de Ko à quelques Mo, jamais des dizaines de Mo.
+MAX_SCAN_SIZE_BYTES = 25 * 1024 * 1024
+CONTENT_SCAN_CAP_BYTES = 5 * 1024 * 1024
+
+
+def _sha256_of(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def default_content_patterns():
+    """Motif(s) actifs par défaut, indépendamment de toute configuration
+    de l'organisation — voir docstring du module pour pourquoi EICAR."""
+    return [(
+        EICAR_TEST_STRING.encode("ascii"),
+        {
+            "type": "content_pattern", "value": "EICAR",
+            "severity": "high",
+            "description": "Chaîne de test EICAR (fichier de test antivirus standard, sans danger réel)",
+        },
+    )]
+
+
+def load_content_patterns(iocs):
+    """iocs : liste brute renvoyée par /api/agents/iocs (voir fetch_iocs
+    dans edr_agent.py). Extrait les IoC de type "content_pattern" et les
+    ajoute au motif EICAR intégré — toujours actif, même sans aucun IoC
+    configuré côté organisation."""
+    patterns = default_content_patterns()
+    for ioc in iocs:
+        if ioc.get("type") == "content_pattern" and ioc.get("value"):
+            patterns.append((ioc["value"].encode("utf-8", errors="ignore"), ioc))
+    return patterns
+
+
+def scan_file_for_threats(path, known_hashes, content_patterns):
+    """known_hashes : dict sha256_minuscule -> IoC (même format que
+    _iocs_cache["hash"] dans edr_agent.py). content_patterns : liste de
+    (motif_bytes, IoC) — voir load_content_patterns().
+
+    Retourne {"matched": True, "kind": "hash"|"content_pattern",
+    "ioc": ..., "hash": ...} au premier signal trouvé, ou None si rien
+    ne correspond OU si le fichier est illisible/trop volumineux/déjà
+    disparu (un faux négatif silencieux est préférable à faire planter
+    le thread de surveillance qui hérite de cet appel)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size > MAX_SCAN_SIZE_BYTES:
+        return None
+
+    digest = _sha256_of(path)
+    if digest and digest.lower() in known_hashes:
+        return {"matched": True, "kind": "hash", "ioc": known_hashes[digest.lower()], "hash": digest}
+
+    if content_patterns:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(CONTENT_SCAN_CAP_BYTES)
+        except OSError:
+            head = b""
+        if head:
+            for pattern_bytes, ioc in content_patterns:
+                if pattern_bytes and pattern_bytes in head:
+                    return {"matched": True, "kind": "content_pattern", "ioc": ioc, "hash": digest}
+
+    return None

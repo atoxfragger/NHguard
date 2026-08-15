@@ -771,8 +771,8 @@ def add_ioc():
     data = request.get_json(force=True) or {}
     ioc_type = data.get("type")
     value = data.get("value", "").strip()
-    if ioc_type not in ("hash", "ip", "cmdline_pattern") or not value:
-        return jsonify({"error": "type (hash/ip/cmdline_pattern) et value requis"}), 400
+    if ioc_type not in ("hash", "ip", "cmdline_pattern", "content_pattern") or not value:
+        return jsonify({"error": "type (hash/ip/cmdline_pattern/content_pattern) et value requis"}), 400
     ioc_id = db_data.create_ioc(
         request.org_id, ioc_type, value,
         severity=data.get("severity", "high"), description=data.get("description", ""),
