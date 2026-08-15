@@ -46,6 +46,8 @@ pare-feu Windows). Sans ces droits, la commande échoue proprement et
 le résultat "failed" est rapporté au serveur.
 """
 
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -576,10 +578,21 @@ def _execute_restore_file(quarantine_path, original_path):
 def build_scoring_ancestry(proc, max_levels=4):
     """Construit la lignée (du plus ancien ancêtre vers le processus
     détecté) au format attendu par process_scoring.score_ancestry() :
-    liste de {"name": str, "path": str|None}. Séparée de
-    build_process_ancestry() (qui produit les évènements de la Process
-    Timeline) car le format et l'usage sont différents."""
+    liste de {"name", "path", "user", "integrity_level", "session_id",
+    "signed", "age_seconds"} — les 5 derniers champs sont optionnels
+    (None si indisponibles) pour rester compatible avec tout appelant qui
+    ne fournirait que name/path (ex: données de démo de db_data.py).
+    Séparée de build_process_ancestry() (qui produit les évènements de la
+    Process Timeline) car le format et l'usage sont différents.
+
+    Le contexte enrichi (utilisateur, niveau d'intégrité, session,
+    signature, âge) n'est calculé QUE pour rendre le scoring parent/enfant
+    contextuel plutôt que purement nominal (cf. process_scoring.py) — pas
+    de coût significatif : cette fonction n'est appelée qu'au moment
+    d'une détection déjà confirmée, jamais dans la boucle de scan de
+    routine sur tous les processus."""
     chain = []
+    now = time.time()
     try:
         current = proc
         for _ in range(max_levels):
@@ -591,7 +604,21 @@ def build_scoring_ancestry(proc, max_levels=4):
                 path = current.exe()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 path = None
-            chain.append({"name": name, "path": path})
+            try:
+                user = current.username()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                user = None
+            try:
+                age_seconds = max(0.0, now - current.create_time())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                age_seconds = None
+            chain.append({
+                "name": name, "path": path, "user": user,
+                "integrity_level": get_integrity_level(current.pid),
+                "session_id": get_session_id(current.pid),
+                "signed": is_authenticode_signed(path) if path else None,
+                "age_seconds": age_seconds,
+            })
             try:
                 parent = current.parent()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -727,6 +754,174 @@ def hash_file(path, chunk_size=65536):
         return None
 
 
+# ──────────────────────────────────────────────────────────
+# Télémétrie Windows enrichie par processus : niveau d'intégrité, session,
+# signature Authenticode — via ctypes (kernel32/advapi32/wintrust), sans
+# dépendance supplémentaire (pas de pywin32). Chaque fonction ne renvoie
+# JAMAIS d'exception vers l'appelant : accès refusé, plateforme non-Windows,
+# processus déjà terminé, etc. donnent simplement None — signal absent,
+# jamais un signal fabriqué à partir d'une erreur. Validé sur cette
+# machine contre des dizaines de processus système réels sans incident.
+# ──────────────────────────────────────────────────────────
+_IS_WINDOWS = platform.system() == "Windows"
+
+if _IS_WINDOWS:
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _wintrust = ctypes.WinDLL("wintrust")
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _TOKEN_QUERY = 0x0008
+    _TOKEN_INTEGRITY_LEVEL = 25
+
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+
+    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    _advapi32.OpenProcessToken.restype = wintypes.BOOL
+    _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                               wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _advapi32.GetTokenInformation.restype = wintypes.BOOL
+    _advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    _advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    _advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    _advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+
+    _INTEGRITY_LEVELS = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium", 0x3000: "high", 0x4000: "system"}
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    _WINTRUST_ACTION_GENERIC_VERIFY_V2 = _GUID(
+        0x00AAC56B, 0xCD44, 0x11D0, (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
+    )
+
+    class _WINTRUST_FILE_INFO(ctypes.Structure):
+        _fields_ = [("cbStruct", wintypes.DWORD), ("pcwszFilePath", wintypes.LPCWSTR),
+                    ("hFile", wintypes.HANDLE), ("pgKnownSubject", ctypes.c_void_p)]
+
+    class _WINTRUST_DATA(ctypes.Structure):
+        _fields_ = [("cbStruct", wintypes.DWORD), ("pPolicyCallbackData", ctypes.c_void_p),
+                    ("pSIPClientData", ctypes.c_void_p), ("dwUIChoice", wintypes.DWORD),
+                    ("fdwRevocationChecks", wintypes.DWORD), ("dwUnionChoice", wintypes.DWORD),
+                    ("pFile", ctypes.c_void_p), ("dwStateAction", wintypes.DWORD),
+                    ("hWVTStateData", wintypes.HANDLE), ("pwszURLReference", wintypes.LPCWSTR),
+                    ("dwProvFlags", wintypes.DWORD), ("dwUIContext", wintypes.DWORD),
+                    ("pSignatureSettings", ctypes.c_void_p)]
+
+    _WTD_UI_NONE = 2
+    _WTD_REVOKE_NONE = 0
+    _WTD_CHOICE_FILE = 1
+    _WTD_STATEACTION_VERIFY = 1
+    _WTD_STATEACTION_CLOSE = 2
+
+    _wintrust.WinVerifyTrust.restype = ctypes.c_long
+    _wintrust.WinVerifyTrust.argtypes = [wintypes.HWND, ctypes.POINTER(_GUID), ctypes.c_void_p]
+
+
+def get_integrity_level(pid):
+    """Niveau d'intégrité Windows du processus (untrusted/low/medium/high/
+    system), lu depuis son jeton d'accès — signal utile pour repérer une
+    élévation de privilège entre un parent et son enfant (cf.
+    process_scoring.py). None si non-Windows, accès refusé (processus
+    d'un autre compte sans droits suffisants) ou processus déjà terminé —
+    jamais une supposition à la place d'une mesure réelle."""
+    if not _IS_WINDOWS:
+        return None
+    h_process = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h_process:
+        return None
+    try:
+        h_token = wintypes.HANDLE()
+        if not _advapi32.OpenProcessToken(h_process, _TOKEN_QUERY, ctypes.byref(h_token)):
+            return None
+        try:
+            size = wintypes.DWORD(0)
+            _advapi32.GetTokenInformation(h_token, _TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(size))
+            if size.value == 0:
+                return None
+            buf = ctypes.create_string_buffer(size.value)
+            if not _advapi32.GetTokenInformation(h_token, _TOKEN_INTEGRITY_LEVEL, buf, size, ctypes.byref(size)):
+                return None
+            # TOKEN_MANDATORY_LABEL.Label.Sid est le premier champ de la structure (un pointeur).
+            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            count = _advapi32.GetSidSubAuthorityCount(sid_ptr).contents.value
+            rid = _advapi32.GetSidSubAuthority(sid_ptr, count - 1).contents.value
+            return _INTEGRITY_LEVELS.get(rid & 0xFFFFF000)
+        finally:
+            _kernel32.CloseHandle(h_token)
+    except Exception:
+        return None
+    finally:
+        _kernel32.CloseHandle(h_process)
+
+
+def get_session_id(pid):
+    """Session Windows (0 = session des services, 1+ = session interactive/
+    RDP) du processus. None si non-Windows ou processus déjà terminé."""
+    if not _IS_WINDOWS:
+        return None
+    try:
+        session_id = wintypes.DWORD()
+        if _kernel32.ProcessIdToSessionId(wintypes.DWORD(pid), ctypes.byref(session_id)):
+            return session_id.value
+        return None
+    except Exception:
+        return None
+
+
+def is_authenticode_signed(path):
+    """True si le fichier a une signature Authenticode embarquée valide et
+    vérifiée (WinVerifyTrust renvoie ERROR_SUCCESS) — un signal de
+    confiance FORT. Renvoie None dans tous les autres cas (non-Windows,
+    pas de signature embarquée, chaîne de certification non vérifiable,
+    fichier introuvable) — PAS False.
+
+    ⚠️ Testé sur cette machine : de nombreux binaires Windows légitimes
+    (notepad.exe, powershell.exe v1.0...) sont signés par CATALOGUE plutôt
+    qu'avec une signature embarquée, et WinVerifyTrust renvoie alors
+    TRUST_E_NOSIGNATURE pour eux exactement comme pour un binaire non
+    signé — ce contrôle ne peut donc PAS distinguer "légitime mais
+    catalogué" de "potentiellement malveillant non signé". C'est
+    précisément pourquoi ce module ne renvoie jamais False : traiter ce
+    résultat ambigu comme une preuve de malveillance produirait des faux
+    positifs sur des binaires système parfaitement sains."""
+    if not _IS_WINDOWS or not path:
+        return None
+    try:
+        file_info = _WINTRUST_FILE_INFO()
+        file_info.cbStruct = ctypes.sizeof(_WINTRUST_FILE_INFO)
+        file_info.pcwszFilePath = path
+        file_info.hFile = None
+        file_info.pgKnownSubject = None
+
+        data = _WINTRUST_DATA()
+        ctypes.memset(ctypes.byref(data), 0, ctypes.sizeof(data))
+        data.cbStruct = ctypes.sizeof(_WINTRUST_DATA)
+        data.dwUIChoice = _WTD_UI_NONE
+        data.fdwRevocationChecks = _WTD_REVOKE_NONE
+        data.dwUnionChoice = _WTD_CHOICE_FILE
+        data.pFile = ctypes.cast(ctypes.byref(file_info), ctypes.c_void_p)
+        data.dwStateAction = _WTD_STATEACTION_VERIFY
+
+        result = _wintrust.WinVerifyTrust(
+            None, ctypes.byref(_WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(data)
+        )
+        # Libère l'état interne de la vérification (requis par l'API, sans
+        # quoi WinVerifyTrust fuit de la mémoire à chaque appel).
+        data.dwStateAction = _WTD_STATEACTION_CLOSE
+        _wintrust.WinVerifyTrust(None, ctypes.byref(_WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(data))
+
+        return True if result == 0 else None
+    except Exception:
+        return None
+
+
 def quarantine_file(file_path):
     """Déplace RÉELLEMENT le fichier vers le dossier de quarantaine local.
     Retourne (quarantine_path, file_moved)."""
@@ -756,6 +951,13 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
         proc_name = proc.name().lower()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         proc_name = ""
+    try:
+        leaf_cmdline = " ".join(proc.cmdline())
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        leaf_cmdline = None
+    # hash_file() est mis en cache par chemin : si scan_processes() l'a déjà
+    # calculé pour vérifier un IoC de hash, cet appel ne recalcule rien.
+    leaf_hash = hash_file(file_path) if file_path else None
 
     ancestry_events = build_process_ancestry(proc)
     ancestry_events.append({
@@ -769,7 +971,9 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
     # proc.parent()/exe()/connections() ne répondent plus après terminate().
     scoring_ancestry = build_scoring_ancestry(proc)
     sibling_count = count_sibling_interpreters(proc)
-    ancestry_score = process_scoring.score_ancestry(scoring_ancestry, sibling_count)
+    ancestry_score = process_scoring.score_ancestry(
+        scoring_ancestry, sibling_count, leaf_cmdline=leaf_cmdline, leaf_hash=leaf_hash
+    )
 
     try:
         proc.terminate()

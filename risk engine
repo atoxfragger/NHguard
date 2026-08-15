@@ -46,12 +46,14 @@ affichée — voir compute_risk() — pour éviter la fatigue d'alertes
 ── Gestion UNKNOWN ──
 "Inconnu" n'est PAS synonyme de "connu et sain" — c'est une absence
 d'information, pas une preuve d'innocence. process_scoring.py distingue
-maintenant explicitement les processus catalogués ("known") des autres
-("unknown") sans changer leur score (voir sa documentation : pénaliser
-tout binaire non catalogué produirait des faux positifs massifs). Ici,
-ce statut n'affecte QUE la confiance : un score construit sur un
-processus jamais catalogué mérite une confiance légèrement plus basse
-qu'un score construit sur un nom reconnu — voir REPUTATION_UNKNOWN_PENALTY.
+maintenant trois états ("known" : nom catalogué, "signed" : nom inconnu
+mais signature Authenticode confirmée, "unknown" : ni l'un ni l'autre)
+sans changer le score dans aucun des cas (voir sa documentation :
+pénaliser tout binaire non catalogué produirait des faux positifs
+massifs). Ici, ce statut n'affecte QUE la confiance : seul "unknown"
+la dégrade légèrement (REPUTATION_UNKNOWN_PENALTY) — "signed" est traité
+comme "known" (pas de pénalité), une signature vérifiée étant un signal
+de confiance à part entière, indépendant du catalogue de noms.
 
 Le module reste volontairement dépourvu de dépendances externes.
 """
@@ -171,13 +173,23 @@ def compute_risk(signals: dict):
 
     Signal optionnel avancé :
       process_scoring : dict {"process": int, "parent_child": int,
-        "file": int, "reputation": "known"|"unknown",
-        "details": [{"rule": str, "points": int}, ...]}
-        produit par process_scoring.score_ancestry() côté agent. Quand il
-        est fourni, il REMPLACE entièrement les catégories process/
-        parent_child/file calculées à partir des booléens ci-dessus —
-        jamais en plus — pour ne jamais compter deux fois le même
-        comportement observé.
+        "file": int, "reputation": "known"|"signed"|"unknown",
+        "details": [{"rule": str, "points": int}, ...],
+        "context": {"user", "integrity_level", "session_id", "signed",
+                    "age_seconds", "cmdline", "hash"}}
+        produit par process_scoring.score_ancestry() côté agent, à partir
+        de la télémétrie enrichie collectée par edr_agent.py (niveau
+        d'intégrité Windows, session, signature Authenticode — voir
+        process_scoring.py pour le détail des règles qui les exploitent :
+        escalade d'intégrité parent→enfant, confiance sur signature
+        confirmée). Quand process_scoring est fourni, il REMPLACE
+        entièrement les catégories process/parent_child/file calculées à
+        partir des booléens ci-dessus — jamais en plus — pour ne jamais
+        compter deux fois le même comportement observé. "context" n'entre
+        dans AUCUN calcul de score ni de confiance ici : il est recopié
+        tel quel dans le résultat pour traçabilité/affichage (dashboard),
+        car la plupart de ces champs (utilisateur, session, âge, ligne de
+        commande, hash) ne sont pas encore transformés en règles de score.
 
     Retourne un dict :
       {
@@ -188,12 +200,14 @@ def compute_risk(signals: dict):
         "confidence": float (0-1),           # certitude de la classification
         "threat_score": int (0-100),         # preuve de malveillance, seule
         "impact_score": int (0-100),         # gravité si confirmé, seule
+        "context": dict,                     # télémétrie enrichie du processus détecté (voir ci-dessus), {} si absente
       }
     """
     s = signals or {}
     raw = {}
     details = []
     reputation_unknown = False
+    context = {}
 
     process_scoring = s.get("process_scoring")
 
@@ -204,6 +218,7 @@ def compute_risk(signals: dict):
         raw["file"] = process_scoring.get("file", 0)
         details = list(process_scoring.get("details", []))
         reputation_unknown = process_scoring.get("reputation") == "unknown"
+        context = process_scoring.get("context") or {}
     else:
         # Repli : anciens signaux booléens simples (agents plus anciens,
         # ou détections ne fournissant pas encore la lignée complète).
@@ -315,4 +330,5 @@ def compute_risk(signals: dict):
         "confidence": confidence,
         "threat_score": threat_score,
         "impact_score": impact_score,
+        "context": context,
     }

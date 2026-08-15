@@ -1,12 +1,29 @@
 """
 process_scoring.py — Scoring de la lignée de processus pour NHGuard
 (réputation, parent → enfant, chaîne grand-parent → parent → enfant,
-emplacement du fichier, profondeur inhabituelle).
+emplacement du fichier, profondeur inhabituelle, signature Authenticode,
+escalade de niveau d'intégrité).
 
 Principe : au lieu de juger un processus isolément ("powershell.exe"),
 on juge la RELATION ("powershell.exe lancé par winword.exe, depuis
 %TEMP%, dans une chaîne de 4 processus") — c'est ce qui permet de
 détecter du comportement malveillant même sans hash ni IoC connus.
+
+── Scoring contextuel, pas seulement nominal ──
+Les règles nom/chemin (PROCESS_BASE_SCORES, PATH_SIGNALS...) restent la
+base, mais edr_agent.py fournit maintenant, par nœud de la lignée, un
+contexte réel capturé sur la machine : utilisateur, niveau d'intégrité
+Windows, session, signature Authenticode, âge du processus (voir
+build_scoring_ancestry() côté agent). Deux règles s'appuient dessus :
+  - une signature Authenticode CONFIRMÉE (pas juste "absente de vérif",
+    voir _sig_discount) réduit le score, comme une preuve de confiance ;
+  - une ESCALADE de niveau d'intégrité entre un parent et son enfant
+    (ex: un processus "medium" qui lance un enfant "system") est un
+    signal de compromission fort, indépendant du nom des processus.
+Les autres champs du contexte (utilisateur, session, âge, ligne de
+commande, hash) ne sont pas encore utilisés pour noter — seulement
+transmis via le champ "context" du résultat, pour affichage/traçabilité
+et comme base d'évolutions futures (cf. reference du produit).
 
 Règles structurées (pas de centaines de conditions if/else en dur) pour
 rester lisible et faciles à faire évoluer. Chaque règle documente
@@ -81,6 +98,25 @@ DEPTH_BONUS_PER_LEVEL = 5      # profondeur de chaîne inhabituelle...
 MAX_DEPTH_BONUS = 10           # ...plafonnée pour ne pas générer de faux positifs
 SIGNED_MS_DISCOUNT = -10       # emplacement système Windows connu (proxy de signature)
 
+# Signature Authenticode CONFIRMÉE (résultat positif de WinVerifyTrust,
+# voir edr_agent.py:is_authenticode_signed) — preuve directe, plus forte
+# que le proxy de chemin ci-dessus. Volontairement PAS de pénalité
+# symétrique pour "non signé" : de nombreux binaires Windows légitimes
+# (notepad.exe, powershell.exe v1.0...) sont signés par catalogue et
+# renvoient le même résultat "non concluant" qu'un binaire réellement non
+# signé — les traiter comme suspects produirait des faux positifs sur des
+# binaires système sains (constaté en testant is_authenticode_signed()).
+SIGNED_TRUSTED_DISCOUNT = -15
+
+# Escalade de niveau d'intégrité Windows entre un parent et son enfant —
+# indépendante du nom des processus, donc utile même sur un binaire
+# totalement inconnu. Seuil à 2 échelons (ex: low->high, medium->system)
+# plutôt que 1, pour ne pas signaler une élévation UAC medium->high
+# banale et fréquente.
+INTEGRITY_RANK = {"untrusted": 0, "low": 1, "medium": 2, "high": 3, "system": 4}
+INTEGRITY_ESCALATION_MIN_JUMP = 2
+INTEGRITY_ESCALATION_BONUS = 25
+
 INTERPRETER_NAMES = {"powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe",
                       "cscript.exe", "mshta.exe"}
 
@@ -95,26 +131,39 @@ def _path_signal(path):
     return 0, None
 
 
-def score_ancestry(ancestry, sibling_interpreter_count=0):
+def score_ancestry(ancestry, sibling_interpreter_count=0, leaf_cmdline=None, leaf_hash=None):
     """ancestry : liste ordonnée du PLUS ANCIEN ancêtre vers le processus
-    détecté — chaque élément {"name": str, "path": str|None}. Le dernier
-    élément est le processus détecté lui-même.
+    détecté — chaque élément {"name": str, "path": str|None} au minimum,
+    avec en plus {"user", "integrity_level", "session_id", "signed",
+    "age_seconds"} si fournis par edr_agent.py (tous optionnels, absents
+    ou None = pas de signal, jamais une supposition). Le dernier élément
+    est le processus détecté lui-même.
 
     sibling_interpreter_count : nombre d'AUTRES interpréteurs (cmd,
     powershell, wscript...) actuellement lancés par le même parent —
     signal de comportement anormal (cf. point 12 du document source).
 
+    leaf_cmdline, leaf_hash : ligne de commande et SHA-256 du processus
+    détecté (optionnels) — pas encore utilisés pour noter ici (le hash
+    sert déjà de correspondance IoC ailleurs, la ligne de commande de
+    motif IoC/intégré ailleurs), seulement recopiés dans "context" pour
+    éviter que le dashboard ait à les redemander séparément.
+
     Retourne {"process": int, "parent_child": int, "file": int,
-              "details": [{"rule": str, "points": int}, ...]}
+              "details": [{"rule": str, "points": int}, ...],
+              "reputation": "known"|"signed"|"unknown",
+              "context": {...}}
     — details sert directement au panneau "Pourquoi cette alerte vaut X ?"
     """
     if not ancestry:
-        return {"process": 0, "parent_child": 0, "file": 0, "details": [], "reputation": "unknown"}
+        return {"process": 0, "parent_child": 0, "file": 0, "details": [],
+                "reputation": "unknown", "context": {}}
 
     details = []
     child = ancestry[-1]
     child_name = (child.get("name") or "").lower()
     child_path = child.get("path")
+    child_signed = child.get("signed")
 
     # 1. Réputation de base du processus détecté. On distingue explicitement
     # "connu" (présent dans PROCESS_BASE_SCORES, bon ou mauvais signe) de
@@ -124,11 +173,19 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
     # faux positifs massifs sur des logiciels légitimes jamais listés ici.
     # Mais "inconnu" n'est PAS la même situation que "connu et sain" pour
     # autant : c'est une absence d'information, pas une preuve d'innocence.
-    # Ce champ "reputation" ne change donc aucun score ici — il alimente
+    # Un binaire non catalogué mais dont la signature Authenticode a été
+    # CONFIRMÉE (child_signed is True) est traité comme "signed" plutôt
+    # que "unknown" — un signal de confiance indépendant du nom.
+    # Ce champ "reputation" ne change aucun score ici — il alimente
     # uniquement le calcul de CONFIANCE du Risk Engine (risk_engine.py) :
     # un score bâti sur des signaux "inconnus" mérite une confiance plus
     # basse qu'un score bâti sur une correspondance connue/confirmée.
-    reputation = "known" if child_name in PROCESS_BASE_SCORES else "unknown"
+    if child_name in PROCESS_BASE_SCORES:
+        reputation = "known"
+    elif child_signed is True:
+        reputation = "signed"
+    else:
+        reputation = "unknown"
     process_score = PROCESS_BASE_SCORES.get(child_name, 0)
     if process_score:
         details.append({"rule": f"Réputation de base : {child_name}", "points": process_score})
@@ -149,7 +206,27 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
             parent_child_score += pair_score
             details.append({"rule": f"{p_name} \u2192 {c_name}", "points": pair_score})
 
-    # 3. Grand-parent -> parent -> enfant : idem, sur toute la chaîne.
+    # 3. Escalade de niveau d'intégrité entre un parent et son enfant —
+    # indépendante du nom des processus (utile même sur un binaire inconnu).
+    # Ex: un processus "medium" qui lance un enfant "system" a probablement
+    # exploité une faille ou détourné un jeton d'accès. Seuil à 2 échelons
+    # (voir INTEGRITY_ESCALATION_MIN_JUMP) pour ignorer une élévation UAC
+    # medium->high banale.
+    for i in range(1, len(ancestry)):
+        p_level = ancestry[i - 1].get("integrity_level")
+        c_level = ancestry[i].get("integrity_level")
+        p_rank = INTEGRITY_RANK.get(p_level)
+        c_rank = INTEGRITY_RANK.get(c_level)
+        if p_rank is not None and c_rank is not None and (c_rank - p_rank) >= INTEGRITY_ESCALATION_MIN_JUMP:
+            p_name = (ancestry[i - 1].get("name") or "").lower()
+            c_name = (ancestry[i].get("name") or "").lower()
+            parent_child_score += INTEGRITY_ESCALATION_BONUS
+            details.append({
+                "rule": f"Escalade d'intégrité : {p_name} ({p_level}) → {c_name} ({c_level})",
+                "points": INTEGRITY_ESCALATION_BONUS,
+            })
+
+    # 4. Grand-parent -> parent -> enfant : idem, sur toute la chaîne.
     for i in range(2, len(ancestry)):
         gp_name = (ancestry[i - 2].get("name") or "").lower()
         p_name = (ancestry[i - 1].get("name") or "").lower()
@@ -163,7 +240,7 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
                 })
                 break  # une seule règle de chaîne comptée par triplet
 
-    # 4. Plusieurs interpréteurs lancés par le même parent (comportement anormal)
+    # 5. Plusieurs interpréteurs lancés par le même parent (comportement anormal)
     if sibling_interpreter_count > 0:
         parent_child_score += MULTI_INTERPRETER_BONUS
         details.append({
@@ -171,7 +248,7 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
             "points": MULTI_INTERPRETER_BONUS,
         })
 
-    # 5. Profondeur de chaîne inhabituelle (petit bonus plafonné seulement,
+    # 6. Profondeur de chaîne inhabituelle (petit bonus plafonné seulement,
     # volontairement — une chaîne longue n'est qu'un indice faible à elle
     # seule, cf. document source point 13)
     depth_bonus = min(MAX_DEPTH_BONUS, max(0, len(ancestry) - 2) * DEPTH_BONUS_PER_LEVEL)
@@ -180,19 +257,35 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
         details.append({"rule": f"Chaîne de {len(ancestry)} processus (profondeur inhabituelle)",
                          "points": depth_bonus})
 
-    # 6. Emplacement du fichier exécuté
+    # 7. Emplacement du fichier exécuté
     file_score = 0
     path_pts, path_label = _path_signal(child_path)
     if path_pts:
         file_score += path_pts
         details.append({"rule": f"Exécuté depuis {path_label}", "points": path_pts})
 
-    # 7. Réduction si emplacement système Windows connu — un SIGNAL de
+    # 8. Réduction si emplacement système Windows connu — un SIGNAL de
     # confiance, jamais une preuve d'innocence (cf. document source point 10)
     if child_path and ("\\windows\\system32\\" in child_path.lower()
                         or "\\windows\\syswow64\\" in child_path.lower()):
         file_score += SIGNED_MS_DISCOUNT
         details.append({"rule": "Emplacement système Windows connu", "points": SIGNED_MS_DISCOUNT})
+
+    # 9. Signature Authenticode CONFIRMÉE (voir SIGNED_TRUSTED_DISCOUNT :
+    # jamais de pénalité symétrique pour "non signé", trop ambigu).
+    if child_signed is True:
+        file_score += SIGNED_TRUSTED_DISCOUNT
+        details.append({"rule": "Signature Authenticode vérifiée", "points": SIGNED_TRUSTED_DISCOUNT})
+
+    context = {
+        "user": child.get("user"),
+        "integrity_level": child.get("integrity_level"),
+        "session_id": child.get("session_id"),
+        "signed": child_signed,
+        "age_seconds": child.get("age_seconds"),
+        "cmdline": leaf_cmdline,
+        "hash": leaf_hash,
+    }
 
     return {
         "process": process_score,
@@ -200,4 +293,5 @@ def score_ancestry(ancestry, sibling_interpreter_count=0):
         "file": file_score,
         "details": details,
         "reputation": reputation,
+        "context": context,
     }
