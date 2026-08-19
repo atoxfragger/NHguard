@@ -928,6 +928,61 @@ def is_server_asset(agent_id):
     return bool(agent_id) and ("srv" in agent_id.lower() or "server" in agent_id.lower())
 
 
+# Heures "de bureau" typiques (heure LOCALE de la machine — un poste
+# éteint le soir puis rallumé au petit matin ne doit pas se faire
+# marquer "hors horaires" à chaque démarrage). Volontairement large
+# (7h-20h, jours ouvrés) : le but est de repérer une activité NETTEMENT
+# atypique (3h du matin, dimanche), pas de pénaliser le télétravail tardif.
+OFF_HOURS_START_HOUR = 7
+OFF_HOURS_END_HOUR = 20
+
+
+def is_off_hours(now=None):
+    """Contexte, pas une preuve : une exécution à 3h du matin n'est
+    malveillante que combinée à d'AUTRES signaux (voir IMPACT_CONTRIBUTION
+    dans risk_engine.py — ce signal ne peut jamais, à lui seul, créer une
+    détection). now : datetime LOCALE optionnelle, pour des tests
+    déterministes — par défaut l'instant présent réel de la machine."""
+    now = now or datetime.now()
+    if now.weekday() >= 5:  # samedi=5, dimanche=6
+        return True
+    return not (OFF_HOURS_START_HOUR <= now.hour < OFF_HOURS_END_HOUR)
+
+
+# Ports historiquement associés à des outils d'exploitation/C2 ou des
+# backdoors connues — une correspondance ici est un signal FAIBLE
+# (contrairement à un IoC IP, qui est une correspondance confirmée) :
+# rien n'empêche un usage légitime d'un de ces ports, mais leur usage
+# RÉEL et documenté par des outils malveillants reste rare en usage
+# normal, contrairement par ex. au port 443. Volontairement une petite
+# liste curatée plutôt qu'une tentative d'exhaustivité illusoire — voir
+# le même principe que pour antivirus_engine.py (honnête sur ce qui est
+# couvert plutôt que de prétendre à une couverture qu'on ne peut pas tenir).
+SUSPICIOUS_PORTS = {
+    4444,   # Metasploit / reverse shell par défaut
+    1337, 31337,  # backdoors "elite" historiques
+    6666, 6667,   # IRC — vecteur classique de botnets
+    12345, 12346,  # NetBus
+    20034,  # NetBus 2 Pro
+    54321,  # Back Orifice 2000
+}
+
+
+def has_suspicious_destination_port(proc):
+    """Le processus a-t-il une connexion sortante ACTIVE vers un port de
+    SUSPICIOUS_PORTS ? Best-effort : proc.connections() peut échouer
+    (accès refusé, processus déjà terminé) sans que ce soit un signal en
+    soi — voir le même traitement pour le reste des collecteurs de
+    edr_agent.py."""
+    try:
+        for conn in proc.connections(kind="inet"):
+            if conn.raddr and conn.raddr.port in SUSPICIOUS_PORTS:
+                return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    return False
+
+
 def hash_file(path, chunk_size=65536):
     if path in _hash_cache:
         return _hash_cache[path]
@@ -1406,6 +1461,7 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
     ancestry_score = process_scoring.score_ancestry(
         scoring_ancestry, sibling_count, leaf_cmdline=leaf_cmdline, leaf_hash=leaf_hash
     )
+    suspicious_port = has_suspicious_destination_port(proc)  # aussi AVANT terminate()
 
     try:
         proc.terminate()
@@ -1429,6 +1485,8 @@ def handle_detection(cfg, proc, title, description, severity, category, reason, 
         "persistence_path": is_persistence_path(file_path),
         "admin_or_system_user": is_admin_or_system_user(get_logged_in_user()),
         "server_asset": is_server_asset(cfg.get("agent_id")),
+        "off_hours": is_off_hours(),
+        "network_suspicious_port": suspicious_port,
     }
     if extra_signals:
         signals.update(extra_signals)

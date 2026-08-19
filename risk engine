@@ -100,6 +100,7 @@ THREAT_WEIGHTS = {
     "file_unknown":        10,   # fichier non répertorié / non catégorisé
     "file_ms_signed_path": -30,  # chemin sous un dossier système Windows connu
     "network_suspect":     20,   # connexion vers une IP figurant dans les IoC
+    "network_suspicious_port": 12,  # port historiquement associé à un outil d'exploitation/backdoor
     "persistence":         30,   # dépôt dans un emplacement de démarrage automatique
     "ioc_confirmed":       40,   # correspondance directe avec un IoC (hash, nom connu)
     "reputation_low":      10,   # fichier inconnu, non signé, hors dossier système
@@ -113,14 +114,15 @@ THREAT_WEIGHTS = {
 IMPACT_WEIGHTS = {
     "identity_privileged": 10,   # exécuté par un compte administrateur/système
     "environment_critical": 10,  # machine considérée comme un actif sensible (serveur...)
+    "off_hours": 5,               # exécution hors des heures ouvrées habituelles
 }
 
 # Catégories concernées par chaque axe (mêmes clés que le dict `raw` interne).
 THREAT_CATEGORIES = {
     "process", "command_line", "parent_child", "file", "network",
-    "persistence", "ioc", "reputation", "correlation", "rarity",
+    "network_heuristic", "persistence", "ioc", "reputation", "correlation", "rarity",
 }
-IMPACT_CATEGORIES = {"identity", "environment"}
+IMPACT_CATEGORIES = {"identity", "environment", "temporal_context"}
 
 CATEGORY_LABELS = {
     "process":      "Processus",
@@ -128,6 +130,7 @@ CATEGORY_LABELS = {
     "parent_child":  "Parent / Enfant",
     "file":         "Fichier",
     "network":      "Réseau",
+    "network_heuristic": "Réseau (indice)",
     "persistence":  "Persistance",
     "identity":     "Identité",
     "ioc":          "IOC",
@@ -135,6 +138,7 @@ CATEGORY_LABELS = {
     "environment":  "Environnement",
     "correlation":  "Corrélation",
     "rarity":       "Rareté",
+    "temporal_context": "Contexte temporel",
 }
 
 # Certitude intrinsèque de chaque famille de signal THREAT (0-1) — sert au
@@ -149,6 +153,7 @@ CONFIDENCE_WEIGHTS = {
     "parent_child": 0.65,  # heuristique LOLBin, solide mais pas une preuve directe
     "file":         0.50,  # heuristique de chemin, faible seule
     "network":      0.75,  # correspondance IoC IP, assez fiable
+    "network_heuristic": 0.40,  # port isolément suspect, mais rien ne garantit qu'il soit malveillant ICI
     "persistence":  0.80,  # fait constaté (chemin de démarrage), difficile à contester
     "ioc":          0.95,  # correspondance directe hash/nom connu, quasi certaine
     "reputation":   0.35,  # absence de catalogage
@@ -291,6 +296,18 @@ def compute_risk(signals: dict):
     # Réseau
     raw["network"] = THREAT_WEIGHTS["network_suspect"] if s.get("ioc_ip_match") else 0
 
+    # Port réseau suspect — catégorie SÉPARÉE de "network" ci-dessus,
+    # volontairement : une correspondance IoC IP est une preuve confirmée
+    # (confiance 0.75, voir CONFIDENCE_WEIGHTS), un port historiquement
+    # associé à un outil d'exploitation/backdoor (SUSPICIOUS_PORTS dans
+    # edr_agent.py) n'est qu'un indice faible — les fusionner dans une
+    # seule catégorie aurait fait porter la confiance de l'IoC confirmé à
+    # un simple indice de port, ou inversement affaibli la confiance d'une
+    # vraie correspondance IoC. Rien n'empêche les deux de contribuer en
+    # même temps sur la même connexion (deux faits différents, pas un
+    # double comptage du même).
+    raw["network_heuristic"] = THREAT_WEIGHTS["network_suspicious_port"] if s.get("network_suspicious_port") else 0
+
     # Persistance
     raw["persistence"] = THREAT_WEIGHTS["persistence"] if s.get("persistence_path") else 0
 
@@ -317,9 +334,13 @@ def compute_risk(signals: dict):
     else:
         raw["rarity"] = 0
 
-    # Identité / Environnement : axe IMPACT, jamais mélangé au threat_score.
+    # Identité / Environnement / Contexte temporel : axe IMPACT, jamais
+    # mélangé au threat_score — voir IMPACT_CONTRIBUTION : ces 3 signaux
+    # NE PEUVENT PAS, même tous réunis, créer un score sans qu'une
+    # catégorie THREAT réelle soit déjà active.
     raw["identity"] = IMPACT_WEIGHTS["identity_privileged"] if s.get("admin_or_system_user") else 0
     raw["environment"] = IMPACT_WEIGHTS["environment_critical"] if s.get("server_asset") else 0
+    raw["temporal_context"] = IMPACT_WEIGHTS["off_hours"] if s.get("off_hours") else 0
 
     # Corrélation : compte les FAMILLES THREAT (jamais impact) dont le
     # score final est positif (hors réputation et rareté, des signaux

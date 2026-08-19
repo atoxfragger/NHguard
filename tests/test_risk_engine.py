@@ -137,3 +137,47 @@ def test_severity_thresholds_are_monotonic_boundaries():
     assert risk_engine._severity_for_score(79) == "high"
     assert risk_engine._severity_for_score(80) == "critical"
     assert risk_engine._severity_for_score(100) == "critical"
+
+
+# ── Réseau : IoC confirmé vs indice de port suspect ──────────
+
+def test_suspicious_port_alone_is_a_weaker_signal_than_confirmed_ioc_ip():
+    """Un port historiquement associé à un outil d'exploitation (voir
+    SUSPICIOUS_PORTS dans edr_agent.py) est un INDICE, pas une preuve --
+    doit rester nettement moins fort (score ET confiance) qu'une
+    correspondance IoC IP confirmée, même si les deux alimentent la même
+    famille "Réseau" au sens large."""
+    port_only = risk_engine.compute_risk({"network_suspicious_port": True})
+    ioc_only = risk_engine.compute_risk({"ioc_ip_match": True})
+    assert port_only["threat_score"] < ioc_only["threat_score"]
+    assert port_only["confidence"] < ioc_only["confidence"]
+
+
+def test_suspicious_port_and_confirmed_ioc_add_up_as_distinct_observations():
+    """Les deux catégories réseau (network / network_heuristic) sont
+    SÉPARÉES précisément pour ne jamais faire porter la confiance d'un
+    IoC confirmé à un simple indice de port -- mais rien n'empêche les
+    deux de s'additionner quand ils se produisent réellement ensemble."""
+    port = risk_engine.compute_risk({"network_suspicious_port": True})
+    ioc = risk_engine.compute_risk({"ioc_ip_match": True})
+    both = risk_engine.compute_risk({"ioc_ip_match": True, "network_suspicious_port": True})
+    assert both["threat_score"] == port["threat_score"] + ioc["threat_score"]
+
+
+# ── Contexte temporel (hors-horaires) ────────────────────────
+
+def test_off_hours_alone_never_creates_a_score():
+    """Même principe que les autres signaux IMPACT (voir
+    test_impact_alone_never_produces_a_score_without_threat) : une
+    exécution hors des heures ouvrées n'est un signal qu'en présence
+    d'une menace déjà réelle, jamais à elle seule."""
+    r = risk_engine.compute_risk({"off_hours": True})
+    assert r["threat_score"] == 0
+    assert r["score"] == 0
+
+
+def test_off_hours_reinforces_an_existing_threat_score():
+    with_context = risk_engine.compute_risk({"ioc_hash_match": True, "off_hours": True})
+    without_context = risk_engine.compute_risk({"ioc_hash_match": True})
+    assert with_context["threat_score"] == without_context["threat_score"]
+    assert with_context["score"] > without_context["score"]
